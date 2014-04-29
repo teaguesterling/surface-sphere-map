@@ -1,5 +1,6 @@
 from __future__ import division
 
+import math
 import itertools
 
 import numpy as np
@@ -166,7 +167,18 @@ def subdivide_icosahedron(vertexes, existing_triangles):
     return np.array(new_vertexes), np.array(new_triangles)
 
 
-def tessellated_sphere(radius=1.0, center=ZERO, iterations=3):
+def iterations_needed_for_triangles(num_triangles):
+    # Faces(iterations) = 20 * 4**iterations
+    return int(math.ceil(math.log(num_triangles/20, 4)))
+
+
+def tessellated_sphere(radius=1.0, center=ZERO, 
+                       iterations=None, 
+                       min_triangles=None):
+    if iterations is None and min_vertices is None:
+        raise ValueError("Please specific either # of iterations or vertices")
+    if min_triangles is not None:
+        iterations = iterations_needed_for_triangles(min_triangles)
     vertexes, triangles = create_icosahedron(radius=1.0, center=ZERO)
     for iteration in range(iterations):
         vertexes, triangles = subdivide_icosahedron(vertexes, triangles)

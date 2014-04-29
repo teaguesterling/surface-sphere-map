@@ -212,13 +212,18 @@ class PseudoGrid(list):
         return np.zeros(self.shape, **kwargs)
 
     @classmethod
-    def from_extents(cls, extents, resolution=1, stretch=None):
+    def from_extents(cls, extents, resolution=1, padding=None, cube=False):
         dims = []
         if not isinstance(resolution, (list, tuple)):
             resolution = [resolution] * len(extents)
         extents = np.apply_along_axis(make_bounds, 1, extents)
-        if stretch is not None:
-            extents = np.apply_along_axis(lambda a: stretch_bounds(a, steps=stretch), 1, extents)
+        if cube:
+            cells = [h-l for l,h in extents]
+            max_cells = max(cells)
+            square_up = [(max_cells - num_cells)//2 for num_cells in cells]
+            extents = [stretch_bounds(bounds, steps=steps) for bounds, steps in zip(extents, square_up)]
+        if padding is not None:
+            extents = np.apply_along_axis(lambda a: stretch_bounds(a, steps=padding), 1, extents)
         for idx, (low, high) in enumerate(extents):
             dims.append(np.arange(low, high, resolution[idx]))
         return cls(dims, resolution=resolution)

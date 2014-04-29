@@ -99,7 +99,9 @@ class Surface(object):
     def neighboring_vertices(self, idx, dist, cycles=False):
         """ idx: Index of vertex to begin at
             dist: Number of steps to take on connectivity graph
-            cycles: Allow graph to loop back and include previously counted vertices
+            cycles: Allow graph to loop back and include previously 
+                    counted vertices
+            Returns: Indicies of neighboring vertices
         """
         neighbors = [idx]
         seen = set()
@@ -112,6 +114,20 @@ class Surface(object):
                     near_by = (n for n in near_by if n not in seen)
                 neighbors.update(near_by)
         return list(neighbors)
+
+    def vertex_normal(self, idx, dist=1):
+        vertex = self.vertices[idx]
+        neighbors = self.neighboring_vertices(self, idx, dist=dist, cycles=False)
+        vertices = self.vertices[neighbors]
+        offsets = vertices - vertex
+        normal = offsets.mean(axis=0)
+        return normal
+
+    def vertex_normal_curvature(self, idx, dist=1):
+        normal = self.vertex_normal(idx, dist=dist)
+        curvature = -np.abs(normal)
+        unit_norm = -normal / curvature
+        return normal, curvature, unit_norm
 
     def approximate_nearest_point(self, point, steps=2):
         nearest_vertex_dist, nearest_idx = self.space.query(point)
