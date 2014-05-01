@@ -1,10 +1,13 @@
 from __future__ import division, print_function
 
+import contextlib
+import logging
+import multiprocessing
 import sys
-from itertools import islice
 
 import numpy as np
 from numpy.linalg import norm
+from scipy.ndimage.morphology import distance_transform_cdt
 
 import spatial
 import sphere
@@ -17,10 +20,33 @@ import voxelize
 from mayavi import mlab
 
 
+@contextlib.contextmanager
+def numpy_error_handling(**settings):
+    old_settings = np.seterr(**settings)
+    yield
+    np.seterr(**old_settings)
+
+
+def normalize_field(A):
+    # Ignore divide by zero (becomes zero)
+    with numpy_error_handling(divide='ignore'):
+        magnitudes = np.sqrt(np.sum(A**2, axis=3))
+        magnitudes[magnitudes == 0] = 1
+        A = A / magnitudes[:,:,:,np.newaxis]
+    return A
+
+
+
+class NullLog(object):
+    def __getattr__(self, name):
+        return lambda x, *args, **kwargs: None
+
+
 class ContourForce(object):
-    def __init__(self, scale=1.0, pool=None):
+    def __init__(self, scale=1.0, pool=None, log=NullLog):
         self._scale = scale
         self._pool = pool
+        self._log = log
 
     def __call__(self, mesh):
         return self.scaled_forces(mesh)
@@ -46,15 +72,24 @@ class ContourForce(object):
 
     def calculate_forces_parallel(self, mesh):
         workers = self._pool._processes
-        raise NotImplementedError("Parallel force calculation not implemented")
+        vertices = len(mesh)
+        per_chunk = vertices // workers
+        evenly_distributed = per_chunks * workers
+        chunks = np.vsplit(mesh[:evenly_distributed], workers)
+        for i, leftover in mesh[evenly_distributed]:
+            chunks[i] = np.vstack([chunks[i], leftover])
+        results = self._pool.map(self.calculate_forces_serial, chunks)
+        forces = np.vstack(results)
+        return forces
+        
         
     def force_at_vertex(vertex, index):
         raise NotImplementedError("Force not implemented for abstract base")
 
 
 class GVFForce(ContourForce):
-    def __init__(self, field, axes, scale=1.0):
-        super(GVFForce, self).__init__(scale=scale)
+    def __init__(self, field, axes, scale=1.0, **kwargs):
+        super(GVFForce, self).__init__(scale=scale, **kwargs)
         self._axes = axes
         self._field = field
 
@@ -62,13 +97,6 @@ class GVFForce(ContourForce):
         voxel = self._axes.get_voxel_index(vertex)
         force = self._field[voxel]
         return force
-    
-    @classmethod
-    def from_image(cls, image, scale=1.0, axes=None, **params):
-        gvf_components = gvf.explicit_gvf3d(image, **params)
-        field = gvf.make_field_array(*gvf_components)
-        force = cls(field, axes=axes, scale=scale)
-        return force, gvf_components
 
 
 class ImplicitInternalForce(ContourForce):
@@ -131,10 +159,13 @@ class Snake(object):
                        internal_scale=.1,
                        smoothness=0.15,
                        timestep=.75,
+                       numsteps=None,
+                       zero_on_boundary=False,
                        normalize=False,
+                       distance_scale=False,
                        tension=1,
                        stiffness=0.0,
-                       max_iterations=10):
+                       max_iterations=100):
         # Target Surface
         self.original_mesh = mesh
         # Voxelization
@@ -145,6 +176,10 @@ class Snake(object):
         # GVF Force
         self.smoothness = smoothness
         self.timestep = timestep
+        self.numsteps = numsteps
+        self.normalize = normalize
+        self.zero_on_boundary = zero_on_boundary
+        self.distance_scale = distance_scale
         # Internal Force
         self.tension = tension
         self.stiffness = stiffness
@@ -168,7 +203,8 @@ class Snake(object):
         self.forces = [
             GVFForce(self.gvf_field, 
                      axes=self.axes, 
-                     scale=self.external_scale),
+                     scale=self.external_scale,
+                     pool=multiprocessing.Pool()),
             CurvatureRegluarizationForce(self.contour, 
                                          scale=self.internal_scale,
                                          alpha=self.tension,
@@ -191,7 +227,7 @@ class Snake(object):
                                                  padding=self.padding,
                                                  cube=True,
                                                  fill=False)
-        self.voxelized = voxelized
+        self.voxelized = np.array(voxelized, dtype=float)
         self.axes = axes
 
     def _create_contour(self):
@@ -210,11 +246,26 @@ class Snake(object):
         self.contour = tessalation
 
     def _calculate_gvf(self):
-        u, v, w = gvf.explicit_gvf3d(self.voxelized,
-                                     mu=self.smoothness,
-                                     dt=self.timestep)
-        self.gvf_components = u, v, w
+        image = np.array(self.voxelized, dtype=float)
+        u, v, w = gvf.reference_gvf3d(image,
+                                      k=self.numsteps,
+                                      mu=self.smoothness,
+                                      dt=self.timestep)
+        if self.zero_on_boundary:
+            mask = 1 - self.voxelized
+            u, v, w, = u * mask, v * mask , w * mask
+            
         gvf_field = gvf.make_field_array(u, v, w)
+
+        if self.normalize:
+            gvf_field = normalize_field(gvf_field)
+
+        if self.distance_scale is not None:
+            # Distance transform is steps from 0
+            distances = distance_transform_cdt(1-image)
+ 
+            
+        self.gvf_components = gvf_field[:,:,:]
         self.gvf_field = gvf_field
 
     @property
