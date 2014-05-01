@@ -31,25 +31,16 @@ DISCRETE_LAP_3D = {
 }
 
 
-def _explicit_gvf_step(u, B, r, C, dt):
-    return (1 - B * dt) * u + r * convolve(u, **DISCRETE_LAP_3D) + C * dt
-
-
-def _explicit_gvf_step(u, B, r, C):
-    return (1 - B) * u + r * laplace(u) + C
-
-
-
-def explicit_gvf3d(f, k=None, mu=0.2, dt=.5, d=(1,1,1), epsilon=None):
+def reference_gvf3d(f, k=None, mu=0.2, dt=.5, d=(1,1,1), epsilon=None):
     N = reduce(operator.mul, f.shape)
     if k is None:
-        k = int((1/dt) * sqrt(N))
+        k = int(1/dt * sqrt(N))
     if epsilon is None:
         epsilon = N * 10e-5
     dx, dy, dz = d
     F = gradient(f)
     Fx, Fy, Fz = F
-    B = Fx**2 + Fy**2 + Fz**2
+    B = Fx*Fx + Fy*Fy + Fz*Fz
     Bdt = B * dt
     Cx, Cy, Cz = F * Bdt
     r = (mu * dt) / (dx * dy * dz)
@@ -58,9 +49,9 @@ def explicit_gvf3d(f, k=None, mu=0.2, dt=.5, d=(1,1,1), epsilon=None):
     delta0 = np.inf
     diverge = 0
     for i in range(k):
-        u = (1-B)*u0 + R*laplace(u0) + Cx
-        v = (1-B)*v0 + R*laplace(v0) + Cz
-        w = (1-B)*w0 + R*laplace(w0) + Cy
+        u = (1-Bdt)*u0 + R*laplace(u0) + Cx
+        v = (1-Bdt)*v0 + R*laplace(v0) + Cy
+        w = (1-Bdt)*w0 + R*laplace(w0) + Cz
         delta = np.sum(abs(u-u0) + abs(v-v0) + abs(w-w0))
         u0, v0, w0 = u, v, w
         if delta <= epsilon:
@@ -68,9 +59,9 @@ def explicit_gvf3d(f, k=None, mu=0.2, dt=.5, d=(1,1,1), epsilon=None):
         elif delta >= delta0:
             diverge += 1
         if diverge > 5:
-            raise ValueError("Divergence detected. Use smaller value of dt")
+            raise ValueError("Divergence detected for 5 consecutive steps. Use smaller value of dt")
         else:
-            delta0 = delta
+            delta0, diverge = delta, 0
     return u0, v0, w0
 
 
