@@ -36,7 +36,6 @@ def normalize_field(A):
     return A
 
 
-
 class NullLog(object):
     def __getattr__(self, name):
         return lambda x, *args, **kwargs: None
@@ -74,17 +73,23 @@ class ContourForce(object):
         workers = self._pool._processes
         vertices = len(mesh)
         per_chunk = vertices // workers
-        evenly_distributed = per_chunks * workers
+        evenly_distributed = per_chunk * workers
         chunks = np.vsplit(mesh[:evenly_distributed], workers)
-        for i, leftover in mesh[evenly_distributed]:
+        for i, leftover in enumerate(mesh[evenly_distributed:]):
             chunks[i] = np.vstack([chunks[i], leftover])
-        results = self._pool.map(self.calculate_forces_serial, chunks)
+        fn = self._apply_forces
+        args = zip(chunks, [self]*len(chunks))
+        print(fn, args)
+        results = self._pool.map(fn, args)
         forces = np.vstack(results)
         return forces
         
-        
     def force_at_vertex(vertex, index):
         raise NotImplementedError("Force not implemented for abstract base")
+
+    @staticmethod
+    def _apply_forces(instance, mesh):
+        return instance.calculate_forces_serial(mesh)
 
 
 class GVFForce(ContourForce):
@@ -203,8 +208,7 @@ class Snake(object):
         self.forces = [
             GVFForce(self.gvf_field, 
                      axes=self.axes, 
-                     scale=self.external_scale,
-                     pool=multiprocessing.Pool()),
+                     scale=self.external_scale),
             CurvatureRegluarizationForce(self.contour, 
                                          scale=self.internal_scale,
                                          alpha=self.tension,
@@ -263,7 +267,7 @@ class Snake(object):
         if self.distance_scale is not None:
             # Distance transform is steps from 0
             distances = distance_transform_cdt(1-image)
- 
+            
             
         self.gvf_components = gvf_field[:,:,:]
         self.gvf_field = gvf_field
