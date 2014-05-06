@@ -22,29 +22,38 @@ def square_up_image(I, padding=1, mode='constant', constant_values=0):
     return padded, extend
 
 
-def voxelize_mesh(mesh, resolution=1.0, cube=True, padding=5, fill=False):
+def voxelize_mesh(mesh, resolution=1.0, 
+                        cube=True, 
+                        padding=5, 
+                        fill=False, 
+                        triangle_map=False):
     axes = PseudoGrid.from_extents(mesh.extents, resolution=resolution,
                                                  padding=padding,
                                                  cube=cube)
-    image, tri_voxels = voxelize_mesh_boundary(mesh, axes, resolution=resolution)
+    image, tri_voxels = voxelize_mesh_boundary(mesh, axes, resolution=resolution,
+                                                           triangle_map=triangle_map)
     if fill:
         image = fill_voxelized_mesh(image, axes, tri_voxels)
-    return image, axes
+    if triangle_map:
+        return image, axes, tri_voxels
+    else:
+        return image, axes
 
 
-def voxelize_mesh_boundary(mesh, axes, resolution=1.0):
+def voxelize_mesh_boundary(mesh, axes, resolution=1.0, triangle_map=False):
     image = axes.get_array(dtype=bool)
     triangle_voxels = defaultdict(list)
     for i, triangle in enumerate(mesh.triangles):
         normal = triangle_normal(triangle)
         voxels = list(axes.get_bounding_voxels(triangle))
-        triangle_voxels[i].extend(voxels)
         for voxel in voxels:
-            if image[voxel]:  # Skip existing voxels
+            if not triangle_map and image[voxel]:  # Skip existing voxels
                 continue
             elif axes.triangle_intersects_voxel(triangle, voxel, 
                                                 normal=normal):
                 image[voxel] = True
+                if triangle_map:
+                    triangle_voxels[voxel].append(i)
     return image, triangle_voxels
         
 

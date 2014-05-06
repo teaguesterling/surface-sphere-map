@@ -6,8 +6,13 @@ import multiprocessing
 import sys
 
 import numpy as np
-from numpy.linalg import norm
-from scipy.ndimage.morphology import distance_transform_cdt
+from scipy.linalg import norm
+from scipy.ndimage.morphology import distance_transform_edt
+from scipy.sparse import (
+    lil_matrix,
+    csc_matrix,
+)
+from scipy.sparse.linalg import factorized
 
 import spatial
 import sphere
@@ -19,6 +24,8 @@ import voxelize
 
 from mayavi import mlab
 
+logging.basicConfig(level=logging.DEBUG)
+
 
 @contextlib.contextmanager
 def numpy_error_handling(**settings):
@@ -27,18 +34,30 @@ def numpy_error_handling(**settings):
     np.seterr(**old_settings)
 
 
-def normalize_field(A):
+def field_magnitudes(A, zero_to_one=False):
     # Ignore divide by zero (becomes zero)
     with numpy_error_handling(divide='ignore'):
         magnitudes = np.sqrt(np.sum(A**2, axis=3))
+    if zero_to_one:
         magnitudes[magnitudes == 0] = 1
-        A = A / magnitudes[:,:,:,np.newaxis]
+    return magnitudes
+
+
+def make_banded_matrix(N, bands):
+    A = np.zeros((N,N))
+    M = len(bands)
+    for band in bands:
+        np.fill_diagonal(A, band)
+        A = np.roll(A, 1, axis=0)
+    A = np.roll(A, -M//2, axis=0)
     return A
 
 
 class NullLog(object):
     def __getattr__(self, name):
         return lambda x, *args, **kwargs: None
+
+
 
 
 class ContourForce(object):
@@ -105,9 +124,35 @@ class GVFForce(ContourForce):
 
 
 class ImplicitInternalForce(ContourForce):
-    def __init__(self, contour, scale=1.0):
+    def __init__(self, scale=1.0, 
+                       alpha=.2,
+                       beta=.1,
+                       dt=1,
+                       ds=1,
+                       n=None):
         super(ImplicitInternalForce, self).__init__(scale=scale)
-        self._contour = contour
+        self._alpha = alpha
+        self._beta = beta
+        self._dt = dt
+        self._ds = ds
+        self._n = n
+        self._setup_system()
+
+    def _setup_system(self):
+        a = (self._alpha * self._dt) / self._ds**2
+        b = (self._beta * self._dt) / self._ds**4
+        p = b
+        q = -a - 4*b
+        r = 1 + 2*a + 6*b
+            
+
+    def calculate_forces(self, vertices):
+        X, Y, Z = vertices.transpose()
+        Fx = solve_banded((2,2), self._M, X)
+        Fy = solve_banded((2,2), self._M, Y)
+        Fz = solve_banded((2,2), self._M, Z)
+        forces = np.array([Fx, Fy, Fz]).transpose()
+        return forces
 
 
 class CurvatureRegluarizationForce(ContourForce):
@@ -166,11 +211,13 @@ class Snake(object):
                        timestep=.75,
                        numsteps=None,
                        zero_on_boundary=False,
-                       normalize=False,
-                       distance_scale=False,
+                       normalize_force_after_distance=None,
                        tension=1,
                        stiffness=0.0,
-                       max_iterations=100):
+                       max_iterations=100,
+                       log=logging):
+        self.log = log
+
         # Target Surface
         self.original_mesh = mesh
         # Voxelization
@@ -182,9 +229,8 @@ class Snake(object):
         self.smoothness = smoothness
         self.timestep = timestep
         self.numsteps = numsteps
-        self.normalize = normalize
         self.zero_on_boundary = zero_on_boundary
-        self.distance_scale = distance_scale
+        self.normalize_force_after_distance = normalize_force_after_distance
         # Internal Force
         self.tension = tension
         self.stiffness = stiffness
@@ -201,21 +247,20 @@ class Snake(object):
         self._prep_snake()
         self._create_contour()
         self._calculate_gvf()
+        self._create_tension_system()
 
         self.vertices = self.contour.vertices
         self.faces = self.contour.faces
 
         self.forces = [
-            GVFForce(self.gvf_field, 
-                     axes=self.axes, 
-                     scale=self.external_scale),
-            CurvatureRegluarizationForce(self.contour, 
-                                         scale=self.internal_scale,
-                                         alpha=self.tension,
-                                         beta=self.stiffness)
+            GVFForce(
+                self.gvf_field, 
+                axes=self.axes, 
+                scale=self.external_scale),
         ]
         
     def _translate_mesh(self):
+        self.log.debug("Repositioning source mesh")
         low = self.original_mesh.vertices.min(axis=0)
         high = self.original_mesh.vertices.max(axis=0)
         lower_bound = low - self.padding
@@ -226,13 +271,17 @@ class Snake(object):
         self.mesh = spatial.Surface(vertices, faces)
 
     def _prep_snake(self):
-        voxelized, axes = voxelize.voxelize_mesh(self.mesh,
-                                                 resolution=self.resolution,
-                                                 padding=self.padding,
-                                                 cube=True,
-                                                 fill=False)
+        self.log.debug("Voxelizing mesh")
+        voxel_triangles = {}
+        voxelized, axes, tri_map = voxelize.voxelize_mesh(self.mesh,
+                                                          resolution=self.resolution,
+                                                          padding=self.padding,
+                                                          cube=True,
+                                                          fill=False,
+                                                          triangle_map=True)
         self.voxelized = np.array(voxelized, dtype=float)
         self.axes = axes
+        self.voxel_triangles = tri_map
 
     def _create_contour(self):
         center = self.mesh.centroid
@@ -244,14 +293,15 @@ class Snake(object):
             iterations = sphere.iterations_needed_for_triangles(num_tris)
         else:
             iterations = sphere.iterations_needed_for_triangles(iterations)
+        self.log.debug("Generating spherical contour with {} faces".format(num_tris))
         tessalation = sphere.Sphere.from_tessellation(radius=radius,
                                                       center=center,
                                                       iterations=iterations)
         self.contour = tessalation
 
     def _calculate_gvf(self):
-        image = np.array(self.voxelized, dtype=float)
-        u, v, w = gvf.reference_gvf3d(image,
+        self.log.debug("Starting GVF calculation")
+        u, v, w = gvf.reference_gvf3d(self.voxelized,
                                       k=self.numsteps,
                                       mu=self.smoothness,
                                       dt=self.timestep)
@@ -261,16 +311,37 @@ class Snake(object):
             
         gvf_field = gvf.make_field_array(u, v, w)
 
-        if self.normalize:
-            gvf_field = normalize_field(gvf_field)
-
-        if self.distance_scale is not None:
-            # Distance transform is steps from 0
-            distances = distance_transform_cdt(1-image)
+        if self.normalize_force_after_distance is not None:
+            speed = 10
+            thresh = self.normalize_force_after_distance
+            Minv = 1 / magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
+            D = distance_transform_edt(1-image)
+            H = .5 + .5 * np.tanh(speed * (D - thresh))
+            mask = 1 + H * (Minv - 1)
+            gvf_field = gvf_field * mask
             
-            
-        self.gvf_components = gvf_field[:,:,:]
+        self.gvf_components = gvf_field[:,:,:,0], gvf_field[:,:,:,1], gvf_field[:,:,:,2]
         self.gvf_field = gvf_field
+
+    def _create_tension_system(self):
+        self.log.debug("Generating internal tension system")
+        dt, ds = 1, 1
+        a = self.tension * dt / (ds ** 2)
+        q_r = {
+            6: (-a / 6, 2),
+            5: (-a*5 / 6, 2),
+        }
+        N = len(self.contour.vertices)
+        A = lil_matrix((N,N))
+        for i, M in enumerate(self.contour.neighbors):
+            M = self.contour.neighbors[i]
+            N = len(M)
+            q, r = q_r[N]
+            A[i,i] = r
+            for k in M:
+                A[i,k] = q
+        solver = factorized(csc_matrix(A))
+        self.apply_internal_forces = solver
 
     @property
     def starting_points(self):
@@ -298,6 +369,7 @@ class Snake(object):
         print("Updating contour step {0}".format(self.iterations), file=sys.stderr)
         new_vertices = np.array(self.vertices)
         new_vertices += self.force()
+        new_vertices = self.apply_internal_force(new_vertices)
         delta = abs(self.vertices - new_vertices).sum()
         self.vertices = new_vertices
         return delta
