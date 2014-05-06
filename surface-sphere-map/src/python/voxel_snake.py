@@ -8,10 +8,7 @@ import sys
 import numpy as np
 from scipy.linalg import norm
 from scipy.ndimage.morphology import distance_transform_edt
-from scipy.sparse import (
-    lil_matrix,
-    csc_matrix,
-)
+from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import factorized
 
 import spatial
@@ -328,8 +325,8 @@ class Snake(object):
         dt, ds = 1, 1
         a = self.tension * dt / (ds ** 2)
         q_r = {
-            6: (-a / 6, 2),
-            5: (-a*5 / 6, 2),
+            6: (-a/6, 2.2),
+            5: (-a/5, 2),
         }
         N = len(self.contour.vertices)
         A = lil_matrix((N,N))
@@ -340,8 +337,8 @@ class Snake(object):
             A[i,i] = r
             for k in M:
                 A[i,k] = q
-        solver = factorized(csc_matrix(A))
-        self.apply_internal_forces = solver
+        solver = factorized(A.tocsc())
+        self.apply_internal_force = solver
 
     @property
     def starting_points(self):
@@ -365,13 +362,13 @@ class Snake(object):
             total_force += force(self.vertices)
         return total_force
 
+
     def update(self):
         print("Updating contour step {0}".format(self.iterations), file=sys.stderr)
-        new_vertices = np.array(self.vertices)
-        new_vertices += self.force()
-        new_vertices = self.apply_internal_force(new_vertices)
-        delta = abs(self.vertices - new_vertices).sum()
-        self.vertices = new_vertices
+        updated = np.array(self.vertices + self.force())
+        updated = np.apply_along_axis(self.apply_internal_force, 0, updated)
+        delta = abs(self.vertices - updated).sum()
+        self.vertices = updated
         return delta
 
     def run(self):
