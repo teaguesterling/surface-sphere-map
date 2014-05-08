@@ -47,7 +47,7 @@ def voxelize_mesh_boundary(mesh, axes, resolution=1.0, triangle_map=False):
         normal = triangle_normal(triangle)
         voxels = list(axes.get_bounding_voxels(triangle))
         for voxel in voxels:
-            if not triangle_map and image[voxel]:  # Skip existing voxels
+            if image[voxel] and not triangle_map:  # Skip existing voxels
                 continue
             elif axes.triangle_intersects_voxel(triangle, voxel, 
                                                 normal=normal):

@@ -12,6 +12,8 @@ from scipy.ndimage.filters import (
     convolve,
     laplace,
 )
+from scipy.sparse import lil_matrix
+from scipy.sparse.linalg import spsolve
 
 LAPLACIAN_3D_STENCIL = np.array([
     [[0,  0,  0],
@@ -63,7 +65,7 @@ def reference_gvf3d(f, k=None, mu=0.2, dt=.5, d=(1,1,1), epsilon=None):
         else:
             delta0, diverge = delta, 0
     return u0, v0, w0
-
+    
 
 def make_field_array(x, y, z, shape=None):
     if shape is None:
@@ -74,3 +76,7 @@ def make_field_array(x, y, z, shape=None):
     vectors = np.asarray(zip(*map(np.ndarray.flatten, vals)))
     field = vectors.reshape(shape + [len(shape)])
     return field
+
+
+def curvature_field():
+    pass

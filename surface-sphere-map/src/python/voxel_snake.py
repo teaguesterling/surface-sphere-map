@@ -55,8 +55,6 @@ class NullLog(object):
         return lambda x, *args, **kwargs: None
 
 
-
-
 class ContourForce(object):
     def __init__(self, scale=1.0, pool=None, log=NullLog):
         self._scale = scale
@@ -114,85 +112,37 @@ class GVFForce(ContourForce):
         self._axes = axes
         self._field = field
 
+    def calculate_forces(self, mesh):
+        vX, vY, vZ = self._axes.map_to_axes(mesh).transpose()
+        force = self._field[vX, vY, vZ, :]
+        return force
+
     def force_at_vertex(self, vertex, index):
         voxel = self._axes.get_voxel_index(vertex)
         force = self._field[voxel]
         return force
 
 
-class ImplicitInternalForce(ContourForce):
-    def __init__(self, scale=1.0, 
-                       alpha=.2,
-                       beta=.1,
-                       dt=1,
-                       ds=1,
-                       n=None):
-        super(ImplicitInternalForce, self).__init__(scale=scale)
-        self._alpha = alpha
-        self._beta = beta
-        self._dt = dt
-        self._ds = ds
-        self._n = n
-        self._setup_system()
-
-    def _setup_system(self):
-        a = (self._alpha * self._dt) / self._ds**2
-        b = (self._beta * self._dt) / self._ds**4
-        p = b
-        q = -a - 4*b
-        r = 1 + 2*a + 6*b
-            
-
-    def calculate_forces(self, vertices):
-        X, Y, Z = vertices.transpose()
-        Fx = solve_banded((2,2), self._M, X)
-        Fy = solve_banded((2,2), self._M, Y)
-        Fz = solve_banded((2,2), self._M, Z)
-        forces = np.array([Fx, Fy, Fz]).transpose()
-        return forces
-
-
-class CurvatureRegluarizationForce(ContourForce):
-    def __init__(self, contour, scale=1.0, grad=None, alpha=1.0, beta=0.5):
-        super(CurvatureRegluarizationForce, self).__init__(scale=scale)
-        self._contour = contour
-        self._grad = grad
-        self._alpha = alpha
-        self._beta = beta
-
-    def update_after_step(self, mesh):
-        self._vertices = mesh
-
-    def curvature_force(self, vertex, index):
-        # From 3-D Active Contours (Dufor et. al.)
-        n, k, un = self.contour.vertex_normal_curvature(index)
-        voxel = self._axes.position_on_axes(vertex)
-        f = self._grad[voxel]
-        g = self._image[voxel]
-        curvature = (g * n) - np.dot(f, un) * un
-        return curvature
-
-    def internal_force(self, vertex, index):
-        c1, n1 = self._control_value(index, 1)
-        c2, n2 = self._control_value(index, 2)
-        elasticity = c1 - n1 * vertex
-        rigidity = c2 -  4 * c1 - (4 * n1 - n2) * vertex
-        force = self._alpha * elasticity + self._beta * rigidity
-        return force
-
-    def _control_value(self, index, dist):
-        neighbors = self._contour.neighboring_vertices(index, dist, cycles=False)
-        points = self._vertices[neighbors]
-        control = points.sum(axis=0)
-        N = len(points)
-        return control, N
+class SurfaceForce(ContourForce):
+    def __init__(self, axes, voxel_map, surface, scale=1.0, **kwargs):
+        super(SurfaceForce, self).__init__(scale=scale, **kwargs)
+        self._axes = axes
+        self._voxel_map = voxel_map
+        self._surface = surface
 
     def force_at_vertex(self, vertex, index):
-        return self.internal_force(vertex, index)
-
-    @classmethod
-    def from_contour(cls, contour, scale=1.0, alpha=1.0, beta=0.5):
-        force = cls(contour, image=None, scale=scale, alpha=alpha, beta=beta)
+        voxel = self._axes.get_voxel_index(vertex)
+        if voxel not in self._voxel_map:
+            return np.zeros(vertex.shape)
+        faces = self._voxel_map[voxel]
+        print(len(faces))
+        nearest, min_dist = None, np.inf
+        for face in faces:
+            triangle = self._surface.triangles[face]
+            dist, point = spatial.distance_to_triangle(vertex, triangle, with_point=True)
+            if dist < min_dist:
+                nearest, min_dist = point, dist
+        force = point - vertex
         return force
 
 
@@ -209,7 +159,7 @@ class Snake(object):
                        numsteps=None,
                        zero_on_boundary=False,
                        normalize_force_after_distance=None,
-                       tension=1,
+                       tension=.2,
                        stiffness=0.0,
                        max_iterations=100,
                        log=logging):
@@ -244,16 +194,21 @@ class Snake(object):
         self._prep_snake()
         self._create_contour()
         self._calculate_gvf()
-        self._create_tension_system()
+        self._create_internal_system()
 
         self.vertices = self.contour.vertices
         self.faces = self.contour.faces
 
         self.forces = [
             GVFForce(
-                self.gvf_field, 
+                field=self.gvf_field, 
                 axes=self.axes, 
                 scale=self.external_scale),
+            #SurfaceForce(
+            #    axes=self.axes, 
+            #    voxel_map=self.voxel_triangles,
+            #    surface=self.mesh,
+            #    scale=1)
         ]
         
     def _translate_mesh(self):
@@ -289,6 +244,7 @@ class Snake(object):
             num_tris = len(self.mesh.faces)
             iterations = sphere.iterations_needed_for_triangles(num_tris)
         else:
+            num_tris = iterations
             iterations = sphere.iterations_needed_for_triangles(iterations)
         self.log.debug("Generating spherical contour with {} faces".format(num_tris))
         tessalation = sphere.Sphere.from_tessellation(radius=radius,
@@ -320,24 +276,26 @@ class Snake(object):
         self.gvf_components = gvf_field[:,:,:,0], gvf_field[:,:,:,1], gvf_field[:,:,:,2]
         self.gvf_field = gvf_field
 
-    def _create_tension_system(self):
-        self.log.debug("Generating internal tension system")
+    def _create_internal_system(self):
+        self.log.debug("Generating internal energy system")
         dt, ds = 1, 1
-        a = self.tension * dt / (ds ** 2)
-        q_r = {
-            6: (-a/6, 2.2),
-            5: (-a/5, 2),
-        }
+        a = self.internal_scale * self.tension * dt / (ds ** 2)
+        b = self.internal_scale * self.stiffness * dt / (ds ** 2)
         N = len(self.contour.vertices)
         A = lil_matrix((N,N))
-        for i, M in enumerate(self.contour.neighbors):
-            M = self.contour.neighbors[i]
-            N = len(M)
-            q, r = q_r[N]
+        for i, M1 in self.contour.neighbors.iteritems():
+            M2 = self.contour.neighboring_vertices(i, 2)
+            N1, N2 = len(M1), len(M2)
+            p, q, r = b, -a - 2*4*b, 1 + N1*a + (4*N1-N2)*b
             A[i,i] = r
-            for k in M:
+            for k in M1:
                 A[i,k] = q
-        solver = factorized(A.tocsc())
+            for k in M2:
+                A[i,k] = p
+
+        self.log.debug("Factoring internal energy system")
+        self._internal_system = A.tocsc()
+        solver = factorized(self._internal_system)
         self.apply_internal_force = solver
 
     @property

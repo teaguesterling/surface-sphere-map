@@ -1,5 +1,6 @@
 
 import itertools
+import operator
 
 import numpy as np
 from numpy.linalg import norm
@@ -60,9 +61,20 @@ class PseudoGrid(list):
         return super(PseudoGrid, self).__getitem__(i)
 
     def position_on_axes(self, point):
-        points_in_dim = zip(self, point)
-        insert_idx = tuple(itertools.starmap(np.searchsorted, points_in_dim))
+        if self._resolution is not None:
+            low = np.array(map(operator.itemgetter(0), self.extents))
+            res = self._resolution
+            insert_idx = tuple(np.trunc((point - low) / res).astype(np.int) + 1)
+        else:
+            points_in_dim = zip(self, point)
+            insert_idx = tuple(itertools.starmap(np.searchsorted, points_in_dim))
         return insert_idx 
+
+    def map_to_axes(self, points):
+        low = np.array(map(operator.itemgetter(0), self.extents))
+        res = self._resolution
+        indicies = np.trunc(points - low / res).astype(np.int)
+        return indicies
 
     def nearest(self, point):
         index = self.position_on_axes(point)
