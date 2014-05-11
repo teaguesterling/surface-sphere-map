@@ -264,10 +264,12 @@ class Snake(object):
             
         gvf_field = gvf.make_field_array(u, v, w)
 
-        if self.normalize_force_after_distance is not None:
+        if self.normalize_force_after_distance == 0:
+            gvf_field /= field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
+        elif self.normalize_force_after_distance is not None:
             speed = 10
             thresh = self.normalize_force_after_distance
-            Minv = 1 / magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
+            Minv = 1 / field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
             D = distance_transform_edt(1-image)
             H = .5 + .5 * np.tanh(speed * (D - thresh))
             mask = 1 + H * (Minv - 1)
@@ -286,7 +288,7 @@ class Snake(object):
         for i, M1 in self.contour.neighbors.iteritems():
             M2 = self.contour.neighboring_vertices(i, 2)
             N1, N2 = len(M1), len(M2)
-            p, q, r = b, -a - 2*4*b, 1 + N1*a + (4*N1-N2)*b
+            p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
             A[i,i] = r
             for k in M1:
                 A[i,k] = q
