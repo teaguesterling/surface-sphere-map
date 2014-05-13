@@ -332,15 +332,13 @@ class Snake(object):
         A = lil_matrix((N,N))
         for i, M1 in self.contour.neighbors.iteritems():
             M2 = set(self.contour.neighboring_vertices(i, 2))
-            #p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
-            A[i,i] = 1
+            N1, N2 = len(M1), len(M2)
+            p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
+            A[i,i] = r
             for k1 in M1:
-                A[i,k1] = -a
-                A[i,i] += a
-                for k2 in self.contour.neighbors[k1].intersection(M2):
-                    A[i,k2] = p
-                    A[i,k1] += -2*b
-                    A[i,i] += 3*b
+                A[i,k1] = q
+            for k2 in M2:
+                A[i,k2] = p
 
         self.log.debug("Factoring internal energy system")
         self._internal_system = A.tocsc()
@@ -362,6 +360,9 @@ class Snake(object):
         for vertex, (x, y, z) in itertools.izip(self.vertices, vertex_voxels):
             delta = avg_dist - distances[x,y,z]
             vertex += delta * direction[x,y,z,:]
+
+    def _reset(self):
+        self.vertices = self.contour.vertices.copy()
 
     @property
     def starting_points(self):
