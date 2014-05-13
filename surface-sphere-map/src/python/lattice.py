@@ -1,3 +1,5 @@
+from __future__ import division
+
 
 import itertools
 import operator
@@ -48,6 +50,7 @@ def pw_sum(u, v):
 
 class PseudoGrid(list):
     WRAPPER = np.array
+
     def __init__(self, *args, **kwargs):
         super(PseudoGrid, self).__init__(*args)
         self._resolution = kwargs.get('resolution')
@@ -61,19 +64,19 @@ class PseudoGrid(list):
         return super(PseudoGrid, self).__getitem__(i)
 
     def position_on_axes(self, point):
-        if self._resolution is not None:
-            low = np.array(map(operator.itemgetter(0), self.extents))
-            res = self._resolution
-            insert_idx = tuple(np.trunc((point - low) / res).astype(np.int) + 1)
-        else:
-            points_in_dim = zip(self, point)
-            insert_idx = tuple(itertools.starmap(np.searchsorted, points_in_dim))
-        return insert_idx 
+#        if self._resolution is not None and False:
+        low = np.array(map(operator.itemgetter(0), self.extents))
+        res = np.array(self._resolution)
+        idx = tuple(np.trunc((point - low) / res).astype(np.int))
+#        else:
+#            points_in_dim = zip(self, point)
+#            insert_idx = tuple(itertools.starmap(np.searchsorted, points_in_dim))
+        return idx 
 
     def map_to_axes(self, points):
         low = np.array(map(operator.itemgetter(0), self.extents))
         res = self._resolution
-        indicies = np.trunc(points - low / res).astype(np.int)
+        indicies = np.trunc((points - low) / res).astype(np.int)
         return indicies
 
     def nearest(self, point):
@@ -183,7 +186,7 @@ class PseudoGrid(list):
 
     def get_bounding_voxels(self, points):
         bounds = self.get_bounding_box_indicies(points)
-        index_ranges = [range(l-1, h) for l, h in zip(*bounds)]
+        index_ranges = [range(l, h+1) for l, h in zip(*bounds)]
         voxels = itertools.product(*index_ranges)
         return voxels
 
@@ -229,13 +232,13 @@ class PseudoGrid(list):
         if not isinstance(resolution, (list, tuple)):
             resolution = [resolution] * len(extents)
         extents = np.apply_along_axis(make_bounds, 1, extents)
+        if padding is not None:
+            extents = np.apply_along_axis(lambda a: stretch_bounds(a, steps=padding), 1, extents)
         if cube:
             cells = [h-l for l,h in extents]
             max_cells = max(cells)
-            square_up = [(max_cells - num_cells)//2 for num_cells in cells]
-            extents = [stretch_bounds(bounds, steps=steps) for bounds, steps in zip(extents, square_up)]
-        if padding is not None:
-            extents = np.apply_along_axis(lambda a: stretch_bounds(a, steps=padding), 1, extents)
+            square_up = [(max_cells - num_cells) for num_cells in cells]
+            extents = [stretch_bounds(bounds, steps=steps, bottom=False) for bounds, steps in zip(extents, square_up)]
         for idx, (low, high) in enumerate(extents):
             dims.append(np.arange(low, high, resolution[idx]))
         return cls(dims, resolution=resolution)
@@ -246,9 +249,13 @@ def make_bounds(extents):
     return np.floor(low), np.ceil(high)
 
 
-def stretch_bounds(extents, steps=1):
+def stretch_bounds(extents, steps=1, top=True, bottom=True):
     low, high = extents
-    return low - steps, high + steps
+    if top:
+        high += steps
+    if bottom:
+        low -= steps
+    return low, high
 
 
 def enumerate_gridpoints(dims):

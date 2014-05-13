@@ -23,10 +23,11 @@ def square_up_image(I, padding=1, mode='constant', constant_values=0):
 
 
 def voxelize_mesh(mesh, resolution=1.0, 
-                        cube=True, 
+                        cube=True,
                         padding=5, 
-                        fill=False, 
+                        fill=False,
                         triangle_map=False):
+    
     axes = PseudoGrid.from_extents(mesh.extents, resolution=resolution,
                                                  padding=padding,
                                                  cube=cube)

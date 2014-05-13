@@ -3,10 +3,16 @@ from __future__ import division, print_function
 import contextlib
 import logging
 import multiprocessing
+import itertools
 import sys
 
 import numpy as np
+from scipy import gradient
 from scipy.linalg import norm
+from scipy.ndimage.filters import (
+    laplace,
+    gaussian_filter,
+)
 from scipy.ndimage.morphology import distance_transform_edt
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import factorized
@@ -124,26 +130,30 @@ class GVFForce(ContourForce):
 
 
 class SurfaceForce(ContourForce):
-    def __init__(self, axes, voxel_map, surface, scale=1.0, **kwargs):
+    def __init__(self, axes, voxels, voxel_map, surface, scale=1.0, **kwargs):
         super(SurfaceForce, self).__init__(scale=scale, **kwargs)
         self._axes = axes
+        self._voxels = voxels
         self._voxel_map = voxel_map
         self._surface = surface
+        self._nearby_tris = {}
+        for idx, faces in self._voxel_map.iteritems():
+            self._nearby_tris[idx] = self._surface.triangles[faces]
 
-    def force_at_vertex(self, vertex, index):
-        voxel = self._axes.get_voxel_index(vertex)
-        if voxel not in self._voxel_map:
-            return np.zeros(vertex.shape)
-        faces = self._voxel_map[voxel]
-        print(len(faces))
-        nearest, min_dist = None, np.inf
-        for face in faces:
-            triangle = self._surface.triangles[face]
-            dist, point = spatial.distance_to_triangle(vertex, triangle, with_point=True)
-            if dist < min_dist:
-                nearest, min_dist = point, dist
-        force = point - vertex
-        return force
+    def calculate_forces(self, mesh):
+        forces = np.zeros(mesh.shape)
+        voxels = self._axes.map_to_axes(mesh)
+        for idx, (vertex, voxel) in enumerate(itertools.izip(mesh, voxels)):
+            voxel = tuple(voxel)
+            if self._voxels[voxel]:
+                nearest, min_dist = None, np.inf
+                triangles = self._nearby_tris[voxel]
+                for triangle in triangles:
+                    dist, point = spatial.distance_to_triangle(vertex, triangle, with_point=True)
+                    if dist < min_dist:
+                        nearest, min_dist = point, dist
+                forces[idx] = nearest - vertex
+        return forces
 
 
 class Snake(object):
@@ -152,15 +162,18 @@ class Snake(object):
                        resolution=1,
                        padding=10,
                        contour_faces=None,
+                       blur_radius=None,
                        external_scale=1,
                        internal_scale=.1,
+                       ggvf=False,
                        smoothness=0.15,
-                       timestep=.75,
+                       gvf_timestep=.75,
                        numsteps=None,
-                       zero_on_boundary=False,
+                       on_boundary=False,
                        normalize_force_after_distance=None,
-                       tension=.2,
-                       stiffness=0.0,
+                       tension=0.1,
+                       stiffness=0.1,
+                       timestep=.2,
                        max_iterations=100,
                        log=logging):
         self.log = log
@@ -173,10 +186,12 @@ class Snake(object):
         # Contour
         self.contour_faces = contour_faces
         # GVF Force
+        self.ggvf = ggvf
+        self.blur_radius = blur_radius
         self.smoothness = smoothness
-        self.timestep = timestep
+        self.gvf_timestep = gvf_timestep
         self.numsteps = numsteps
-        self.zero_on_boundary = zero_on_boundary
+        self.on_boundary = on_boundary
         self.normalize_force_after_distance = normalize_force_after_distance
         # Internal Force
         self.tension = tension
@@ -188,7 +203,9 @@ class Snake(object):
 
         self.step = 1
         self.iterations = 0
+        self.timestep = timestep
         self.max_iterations = max_iterations
+        self.epsilon = 0.001
 
         self._translate_mesh()
         self._prep_snake()
@@ -203,21 +220,20 @@ class Snake(object):
             GVFForce(
                 field=self.gvf_field, 
                 axes=self.axes, 
-                scale=self.external_scale),
-            #SurfaceForce(
-            #    axes=self.axes, 
-            #    voxel_map=self.voxel_triangles,
-            #    surface=self.mesh,
-            #    scale=1)
+                scale=self.external_scale*self.timestep),
+            SurfaceForce(
+                axes=self.axes, 
+                voxels=self.voxelized,
+                voxel_map=self.voxel_triangles,
+                surface=self.mesh,
+                scale=1*self.timestep)
         ]
         
     def _translate_mesh(self):
         self.log.debug("Repositioning source mesh")
         low = self.original_mesh.vertices.min(axis=0)
-        high = self.original_mesh.vertices.max(axis=0)
         lower_bound = low - self.padding
         self.low_point = low
-        self.high_point = high
         vertices = self.original_mesh.vertices - lower_bound
         faces = self.original_mesh.faces
         self.mesh = spatial.Surface(vertices, faces)
@@ -254,13 +270,33 @@ class Snake(object):
 
     def _calculate_gvf(self):
         self.log.debug("Starting GVF calculation")
-        u, v, w = gvf.reference_gvf3d(self.voxelized,
-                                      k=self.numsteps,
-                                      mu=self.smoothness,
-                                      dt=self.timestep)
-        if self.zero_on_boundary:
-            mask = 1 - self.voxelized
+        dt = self.gvf_timestep
+        ds = (self.resolution, self.resolution, self.resolution)
+        raw_image = self.voxelized
+        image = raw_image
+        if self.blur_radius is not None:
+            image = gaussian_filter(image, self.blur_radius) * image
+        if self.ggvf:
+            u, v, w = gvf.reference_ggvf3d(image,
+                                           iter=self.numsteps,
+                                           K=self.smoothness,
+                                           dt=self.gvf_timestep,
+                                           ds=ds)
+        else:
+            u, v, w = gvf.reference_gvf3d(image,
+                                          iter=self.numsteps,
+                                          mu=self.smoothness,
+                                          dt=self.gvf_timestep,
+                                          ds=ds)
+        if self.on_boundary == 'zero':
+            mask = 1 - raw_image
             u, v, w, = u * mask, v * mask , w * mask
+        elif self.on_boundary == 'curvature':
+            cu, cv, cw = gradient(laplace(raw_image))
+            mask = 1 - self.voxelized
+            u += cu * mask
+            v += cv * mask
+            w += cw * mask
             
         gvf_field = gvf.make_field_array(u, v, w)
 
@@ -270,9 +306,9 @@ class Snake(object):
             speed = 10
             thresh = self.normalize_force_after_distance
             Minv = 1 / field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
-            D = distance_transform_edt(1-image)
+            D = distance_transform_edt(1-raw_image)
             H = .5 + .5 * np.tanh(speed * (D - thresh))
-            mask = 1 + H * (Minv - 1)
+            mask = 1 + H[:,:,:,np.newaxis] * (Minv - 1)
             gvf_field = gvf_field * mask
             
         self.gvf_components = gvf_field[:,:,:,0], gvf_field[:,:,:,1], gvf_field[:,:,:,2]
@@ -280,7 +316,7 @@ class Snake(object):
 
     def _create_internal_system(self):
         self.log.debug("Generating internal energy system")
-        dt, ds = 1, 1
+        dt, ds = self.timestep, self.resolution
         a = self.internal_scale * self.tension * dt / (ds ** 2)
         b = self.internal_scale * self.stiffness * dt / (ds ** 2)
         N = len(self.contour.vertices)
@@ -290,10 +326,10 @@ class Snake(object):
             N1, N2 = len(M1), len(M2)
             p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
             A[i,i] = r
-            for k in M1:
-                A[i,k] = q
-            for k in M2:
-                A[i,k] = p
+            for k1 in M1:
+                A[i,k1] = q
+            for k2 in M2:
+                A[i,k2] = p
 
         self.log.debug("Factoring internal energy system")
         self._internal_system = A.tocsc()
@@ -319,7 +355,8 @@ class Snake(object):
     def force(self):
         total_force = np.zeros(self.vertices.shape)
         for force in self.forces:
-            total_force += force(self.vertices)
+            force_element = force(self.vertices)
+            total_force += force_element
         return total_force
 
 
@@ -329,6 +366,7 @@ class Snake(object):
         updated = np.apply_along_axis(self.apply_internal_force, 0, updated)
         delta = abs(self.vertices - updated).sum()
         self.vertices = updated
+        self.iterations += 1
         return delta
 
     def run(self):
@@ -337,9 +375,8 @@ class Snake(object):
         delta = np.inf
         # Get snake closer to surface while maintaining total internal energy
         N = len(self.vertices)
-        while delta > 0.01 and self.iterations < self.max_iterations:
+        while delta > self.epsilon and self.iterations < self.max_iterations:
             # Step towards image
-            self.iterations += 1
             change = self.update()
             delta = change / N
             
