@@ -7,8 +7,8 @@ import itertools
 import sys
 
 import numpy as np
-from scipy import gradient
-from scipy.linalg import norm
+from numpy import gradient
+from numpy.linalg import norm
 from scipy.ndimage.filters import (
     laplace,
     gaussian_filter,
@@ -160,16 +160,18 @@ class Snake(object):
 
     def __init__(self, mesh,
                        resolution=1,
-                       padding=10,
+                       padding=15,
                        contour_faces=None,
+                       normalize_contour_distance=False,
                        blur_radius=None,
-                       external_scale=1,
+                       field_scale=1,
+                       snap_scale=1,
                        internal_scale=.1,
-                       ggvf=False,
+                       gvf_mode=None,
                        smoothness=0.15,
                        gvf_timestep=.75,
                        numsteps=None,
-                       on_boundary=False,
+                       curvature_on_boundary=None,
                        normalize_force_after_distance=None,
                        tension=0.1,
                        stiffness=0.1,
@@ -185,20 +187,23 @@ class Snake(object):
         self.resolution = resolution
         # Contour
         self.contour_faces = contour_faces
+        self.normalize_contour_distance = normalize_contour_distance
         # GVF Force
-        self.ggvf = ggvf
+        self.gvf_mode = gvf_mode
         self.blur_radius = blur_radius
         self.smoothness = smoothness
         self.gvf_timestep = gvf_timestep
         self.numsteps = numsteps
-        self.on_boundary = on_boundary
+        self.curvature_on_boundary = curvature_on_boundary
         self.normalize_force_after_distance = normalize_force_after_distance
+
         # Internal Force
         self.tension = tension
         self.stiffness = stiffness
 
         # Force scaling
-        self.external_scale = external_scale
+        self.field_scale = field_scale
+        self.snap_scale = snap_scale
         self.internal_scale = internal_scale
 
         self.step = 1
@@ -216,17 +221,19 @@ class Snake(object):
         self.vertices = self.contour.vertices
         self.faces = self.contour.faces
 
+        self._normalize_distance()
+
         self.forces = [
             GVFForce(
                 field=self.gvf_field, 
                 axes=self.axes, 
-                scale=self.external_scale*self.timestep),
+                scale=self.field_scale*self.timestep),
             SurfaceForce(
                 axes=self.axes, 
                 voxels=self.voxelized,
                 voxel_map=self.voxel_triangles,
                 surface=self.mesh,
-                scale=1*self.timestep)
+                scale=self.snap_scale*self.timestep)
         ]
         
     def _translate_mesh(self):
@@ -252,7 +259,7 @@ class Snake(object):
         self.voxel_triangles = tri_map
 
     def _create_contour(self):
-        center = self.mesh.centroid
+        center = np.array(map(lambda ax: ax[len(ax)//2], self.axes))
         dists = map(np.linalg.norm, self.mesh.vertices - center)
         radius = max(dists)
         iterations = self.contour_faces
@@ -276,7 +283,7 @@ class Snake(object):
         image = raw_image
         if self.blur_radius is not None:
             image = gaussian_filter(image, self.blur_radius) * image
-        if self.ggvf:
+        if self.gvf_mode == 'ggvf':
             u, v, w = gvf.reference_ggvf3d(image,
                                            iter=self.numsteps,
                                            K=self.smoothness,
@@ -288,17 +295,19 @@ class Snake(object):
                                           mu=self.smoothness,
                                           dt=self.gvf_timestep,
                                           ds=ds)
-        if self.on_boundary == 'zero':
+
+        if self.curvature_on_boundary == 0:
             mask = 1 - raw_image
             u, v, w, = u * mask, v * mask , w * mask
-        elif self.on_boundary == 'curvature':
-            cu, cv, cw = gradient(laplace(raw_image))
+        elif self.curvature_on_boundary is not None:
+            cu, cv, cw = map(laplace, gradient(raw_image))
             mask = 1 - self.voxelized
-            u += cu * mask
-            v += cv * mask
-            w += cw * mask
+            u += cu * mask * self.curvature_on_boundary
+            v += cv * mask * self.curvature_on_boundary
+            w += cw * mask * self.curvature_on_boundary
             
         gvf_field = gvf.make_field_array(u, v, w)
+        self._raw_field = gvf_field
 
         if self.normalize_force_after_distance == 0:
             gvf_field /= field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
@@ -322,19 +331,37 @@ class Snake(object):
         N = len(self.contour.vertices)
         A = lil_matrix((N,N))
         for i, M1 in self.contour.neighbors.iteritems():
-            M2 = self.contour.neighboring_vertices(i, 2)
-            N1, N2 = len(M1), len(M2)
-            p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
-            A[i,i] = r
+            M2 = set(self.contour.neighboring_vertices(i, 2))
+            #p, q, r = b, -a - 2*4*b, 1 + N1*a + (2*4*N1-N2)*b
+            A[i,i] = 1
             for k1 in M1:
-                A[i,k1] = q
-            for k2 in M2:
-                A[i,k2] = p
+                A[i,k1] = -a
+                A[i,i] += a
+                for k2 in self.contour.neighbors[k1].intersection(M2):
+                    A[i,k2] = p
+                    A[i,k1] += -2*b
+                    A[i,i] += 3*b
 
         self.log.debug("Factoring internal energy system")
         self._internal_system = A.tocsc()
         solver = factorized(self._internal_system)
         self.apply_internal_force = solver
+
+    def _normalize_distance(self):
+        if not self.normalize_contour_distance:
+            return
+        vertex_voxels = self.axes.map_to_axes(self.vertices)
+        distances = distance_transform_edt(1-self.voxelized)
+        DG = gvf.make_field_array(*gradient(distances))
+        direction = DG / field_magnitudes(DG, zero_to_one=True)[:,:,:,np.newaxis]
+        # Two-pass for memory reasons
+        avg_dist = 0
+        for v in vertex_voxels:
+            avg_dist += distances[v]
+        avg_dist /= len(vertex_voxels)
+        for vertex, (x, y, z) in itertools.izip(self.vertices, vertex_voxels):
+            delta = avg_dist - distances[x,y,z]
+            vertex += delta * direction[x,y,z,:]
 
     @property
     def starting_points(self):
@@ -454,78 +481,6 @@ def main(args, stdin=None, stdout=None):
         show_embedding(snake.image, snake)
     if '--show-travel' in opts:
         show_travel(snake)
-
-
-def show_embedding(s, m, fig=None, ax=None):
-    from mayavi import mlab
-    mlab.clf()
-    if s is not None:
-        args = list(s.vertices.transpose()) + [s.faces]
-        sph = mlab.triangular_mesh(*args)
-    else:
-        sph = None
-    if m is not None:
-        args = list(m.vertices.transpose()) + [m.faces]
-        mol = mlab.triangular_mesh(*args)
-    else:
-        mol = None
-    mlab.show()
-    return sph, mol
-
-
-def show_travel(s, fig=None, ax=None):
-    from matplotlib import pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-    if fig is None:
-        fig = plt.figure()
-    if ax is None:
-        ax = fig.add_subplot(111, projection='3d')
-    else:
-        ax.clear()
-    ax.set_axis_off()
-    ax.axison = False
-    max_travel = s.contour.radius
-    values = []
-    for face in s.faces:
-        travel = s.travel[face].mean()
-        value = (max_travel - travel) / max_travel
-        values.append(value)
-    colors = map(lambda x: (x, x, x), values)
-    sph = ax.plot_trisurf(*s.contour.vertices.transpose(), triangles=s.faces,
-                                                         shade=True)
-    sph.set_facecolors(colors)
-    plt.show()
-    return fig, ax, sph
-
-
-def demo(path, invert=False, fig=None, ax=None):
-    from matplotlib import pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
-    if fig is None:
-        fig = plt.figure()
-    if ax is None:
-        ax = fig.add_subplot(111, projection='3d')
-    ax.set_axis_off()
-    with open(path) as f:
-        surf = spatial.Surface.from_vet_file(f)
-    if invert:
-        snake = Snake3D.create_for_surface_invert(surf, sphere_iterations=2)
-    else:
-        snake = Snake3D.create_for_surface(surf, sphere_iterations=2)
-    for i in range(25):
-       try:
-            sph.remove()
-       except:
-         pass
-       sph = ax.plot_trisurf(*snake.vertices.transpose(), triangles=snake.faces)
-       sph.set_alpha(1)
-       fig.canvas.draw()
-       snake.update()
-       sph.remove()
-       #s.clip += i/.25
-    sph = ax.plot_trisurf(*snake.vertices.transpose(), triangles=snake.faces)
-    return fig, ax
-
 
 
 if __name__ == '__main__':

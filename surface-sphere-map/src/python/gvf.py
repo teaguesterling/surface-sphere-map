@@ -12,6 +12,7 @@ from scipy.ndimage.filters import (
     convolve,
     laplace,
 )
+from scipy.ndimage.morphology import distance_transform_edt
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import spsolve
 
@@ -36,7 +37,7 @@ DISCRETE_LAP_3D = {
 def reference_gvf3d(f, iter=None, mu=0.2, dt=.5, ds=(1,1,1), epsilon=None):
     N = reduce(operator.mul, f.shape)
     if iter is None:
-        iter = int(1/dt * sqrt(N))
+        iter = int(1/dt * N**(1/3))
     if epsilon is None:
         epsilon = N * 10e-5
     dx, dy, dz = ds
@@ -113,5 +114,3 @@ def make_field_array(x, y, z, shape=None):
     return field
 
 
-def curvature_field():
-    pass

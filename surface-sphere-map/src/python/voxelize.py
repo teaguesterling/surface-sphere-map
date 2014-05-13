@@ -9,6 +9,7 @@ import numpy as np
 from spatial import (
     Surface,
     triangle_normal,
+    triangle_normals,
     nearest_triangle,
 )
 from lattice import PseudoGrid
@@ -83,6 +84,15 @@ def fill_voxelized_mesh(image, axes, triangle_voxels):
                 elif filling:
                     image[i,j,k] = True
     return image
+
+
+def normal_in_voxel(mesh, triangle_map, voxelized):
+    shape = list(voxelized.shape) + [3]
+    normals = np.zeros(shape)
+    for index in np.nonzero(voxelized):
+        triangles = triangle_map[index]
+        normals[index] = triangle_normals(triangles).mean(axis=0)
+    return normals
 
 
 def test(path, res=1, fill=False):
