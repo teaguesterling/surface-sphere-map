@@ -10,10 +10,15 @@ import numpy as np
 from numpy import gradient
 from numpy.linalg import norm
 from scipy.ndimage.filters import (
-    laplace,
+    convolve,
     gaussian_filter,
+    laplace,
 )
-from scipy.ndimage.morphology import distance_transform_edt
+from scipy.ndimage.morphology import (
+    distance_transform_edt,
+    generate_binary_structure,
+    binary_dilation,
+)
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import factorized
 
@@ -38,22 +43,32 @@ def numpy_error_handling(**settings):
 
 
 def field_magnitudes(A, zero_to_one=False):
-    # Ignore divide by zero (becomes zero)
-    with numpy_error_handling(divide='ignore'):
-        magnitudes = np.sqrt(np.sum(A**2, axis=3))
+    magnitudes = np.sqrt(np.sum(A**2, axis=-1))
     if zero_to_one:
         magnitudes[magnitudes == 0] = 1
     return magnitudes
 
 
-def make_banded_matrix(N, bands):
-    A = np.zeros((N,N))
-    M = len(bands)
-    for band in bands:
-        np.fill_diagonal(A, band)
-        A = np.roll(A, 1, axis=0)
-    A = np.roll(A, -M//2, axis=0)
-    return A
+def to_field(components):
+    C = np.array(components)
+    D = len(C.shape)
+    F = np.rollaxis(C, 0, D)
+    return F
+
+
+def to_components(field):
+    F = np.array(field)
+    D = len(F.shape)
+    C = np.rollaxis(F, D-1, 0)
+    return C
+
+
+def normalize_field(field):
+    F = field
+    M = field_magnitudes(field, zero_to_one=True)
+    sel = [slice(None, None, None)] * len(M.shape) + [np.newaxis]
+    N = F / M[sel]
+    return N
 
 
 class NullLog(object):
@@ -112,47 +127,47 @@ class ContourForce(object):
         return instance.calculate_forces_serial(mesh)
 
 
-class GVFForce(ContourForce):
+class FieldForce(ContourForce):
     def __init__(self, field, axes, scale=1.0, **kwargs):
         super(GVFForce, self).__init__(scale=scale, **kwargs)
-        self._axes = axes
         self._field = field
 
-    def calculate_forces(self, mesh):
-        vX, vY, vZ = self._axes.map_to_axes(mesh).transpose()
+    def calculate_forces(self, mesh, voxels):
+        vX, vY, vZ = voxels
         force = self._field[vX, vY, vZ, :]
-        return force
-
-    def force_at_vertex(self, vertex, index):
-        voxel = self._axes.get_voxel_index(vertex)
-        force = self._field[voxel]
         return force
 
 
 class SurfaceForce(ContourForce):
-    def __init__(self, axes, voxels, voxel_map, surface, scale=1.0, **kwargs):
+    def __init__(self, voxel_map, surface, scale=1.0, **kwargs):
         super(SurfaceForce, self).__init__(scale=scale, **kwargs)
-        self._axes = axes
-        self._voxels = voxels
         self._voxel_map = voxel_map
         self._surface = surface
         self._nearby_tris = {}
-        for idx, faces in self._voxel_map.iteritems():
-            self._nearby_tris[idx] = self._surface.triangles[faces]
 
-    def calculate_forces(self, mesh):
+        # TODO: This is waseful!
+        for idx, faces in self._voxel_map.iteritems():
+            triangles = self._surface.triangles[faces]
+            normals = spatial.triangle_normals(triangles)
+            self._nearby_tris[idx] = triangles, normals
+
+
+    def calculate_forces(self, mesh, voxels):
         forces = np.zeros(mesh.shape)
-        voxels = self._axes.map_to_axes(mesh)
         for idx, (vertex, voxel) in enumerate(itertools.izip(mesh, voxels)):
             voxel = tuple(voxel)
-            if self._voxels[voxel]:
-                nearest, min_dist = None, np.inf
+            if voxel in self._nearby_tris:
+                nearest, min_dist, inside = None, np.inf, False
                 triangles = self._nearby_tris[voxel]
-                for triangle in triangles:
+                for triangle, normal in triangles:
                     dist, point = spatial.distance_to_triangle(vertex, triangle, with_point=True)
+                    if np.dot(normal, nearest - vertex) > 0:
+                        inside = True
                     if dist < min_dist:
                         nearest, min_dist = point, dist
                 forces[idx] = nearest - vertex
+                if inside:
+                    forces[idx] /= self.scale
         return forces
 
 
@@ -162,11 +177,14 @@ class Snake(object):
                        resolution=1,
                        padding=15,
                        contour_faces=None,
+                       contour_size=None,
                        normalize_contour_distance=False,
                        blur_radius=None,
-                       field_scale=1,
+                       cvf_scale=1,
+                       gvf_scale=1,
+                       gradient_scale=1,
                        snap_scale=1,
-                       internal_scale=.1,
+                       internal_scale=1,
                        gvf_mode=None,
                        smoothness=0.15,
                        gvf_timestep=.75,
@@ -187,8 +205,15 @@ class Snake(object):
         self.resolution = resolution
         # Contour
         self.contour_faces = contour_faces
+        self.contour_size = contour_size
         self.normalize_contour_distance = normalize_contour_distance
+    
+        # Curvature Force
+        self.cvf_scale = cvf_scale
+        self.blur_curvature = None
+
         # GVF Force
+        self.gvf_scale = gvf_scale
         self.gvf_mode = gvf_mode
         self.blur_radius = blur_radius
         self.smoothness = smoothness
@@ -196,17 +221,17 @@ class Snake(object):
         self.numsteps = numsteps
         self.curvature_on_boundary = curvature_on_boundary
         self.normalize_force_after_distance = normalize_force_after_distance
+        
+        # Scap Force
+        self.snap_scale = snap_scale
 
         # Internal Force
         self.tension = tension
         self.stiffness = stiffness
 
         # Force scaling
-        self.field_scale = field_scale
-        self.snap_scale = snap_scale
         self.internal_scale = internal_scale
 
-        self.step = 1
         self.iterations = 0
         self.timestep = timestep
         self.max_iterations = max_iterations
@@ -215,26 +240,39 @@ class Snake(object):
         self._translate_mesh()
         self._prep_snake()
         self._create_contour()
-        self._calculate_gvf()
         self._create_internal_system()
+        self._calculate_gvf()
+        self._calculate_cvf()
 
         self.vertices = self.contour.vertices
         self.faces = self.contour.faces
 
         self._normalize_distance()
 
-        self.forces = [
-            GVFForce(
-                field=self.gvf_field, 
-                axes=self.axes, 
-                scale=self.field_scale*self.timestep),
-            SurfaceForce(
-                axes=self.axes, 
-                voxels=self.voxelized,
-                voxel_map=self.voxel_triangles,
-                surface=self.mesh,
-                scale=self.snap_scale*self.timestep)
-        ]
+        self.forces = []
+
+        if self.gvf_scale is not None:
+            self.forces.append(
+                FieldForce(
+                    field=self.gvf_field, 
+                    scale=self.gvf_scale*self.timestep))
+
+        if self.cvf_scale is not None:
+            self.forces.append(
+                FieldForce(
+                    field=self.cvf_field, 
+                    scale=self.cvf_scale*self.timestep))
+        
+        if self.snap_scale is not None:
+            self.forces.append(
+                SurfaceForce(
+                    voxels=self.voxelized,
+                    voxel_map=self.voxel_triangles,
+                    surface=self.mesh,
+                    scale=self.snap_scale*self.timestep))
+
+        if self.snap_scale is None:
+            self.forces = self.forces[:1]
         
     def _translate_mesh(self):
         self.log.debug("Repositioning source mesh")
@@ -262,6 +300,8 @@ class Snake(object):
         center = np.array(map(lambda ax: ax[len(ax)//2], self.axes))
         dists = map(np.linalg.norm, self.mesh.vertices - center)
         radius = max(dists)
+        if self.contour_size is not None:
+            radius = self.contour_size * radius
         iterations = self.contour_faces
         if iterations is None:
             num_tris = len(self.mesh.faces)
@@ -320,8 +360,57 @@ class Snake(object):
             mask = 1 + H[:,:,:,np.newaxis] * (Minv - 1)
             gvf_field = gvf_field * mask
             
-        self.gvf_components = gvf_field[:,:,:,0], gvf_field[:,:,:,1], gvf_field[:,:,:,2]
+        self.gvf_components = to_components(gvf_field)
         self.gvf_field = gvf_field
+
+    def _scale_curvature_level(self, level, index):
+        level[level > 0] = index + 1
+        return level
+
+    def _calculate_cvf(self):
+        self.log.debug("Generating Curvature Flow")
+        image = self.voxelized.copy()
+        max_steps = max(image.shape)
+        min_grow_curvature = 2
+        levels = image.copy()
+        delta = np.inf
+        i = 0
+
+        # Fill in concavities to form cube
+        while delta > 0 and i < max_steps:
+            curvature = laplace(image)
+            curvature[image > 0] = 0
+            curvature[curvature < min_grow_curvature] = 0
+            dilation = curvature.copy()
+            dilation[dilation > 0] = 1
+            delta = np.count_nonzero(dilation)
+            image += dilation
+            curvature = self._scale_curvature_level(curvature, i)
+            levels += curvature
+            i += 1
+
+        # Fill in remainder of the grid 
+        while delta > 0 and i < max_steps:
+            offsets = convolve(levels, generate_binary_structure(3, 1))
+            level = offsets + 1
+            level[image > 0] = 0
+            level[offsets == 0] = 0
+            dilation = level.copy()
+            dilation[dilation > 0] = 1
+            delta = np.count_nonzero(dilation)
+            image += dilation
+            levels += level
+            i += 1
+
+        if self.blur_curvature:
+            levels = gaussian_filter(levels, self.blur_curvature)
+
+        field = -to_field(np.gradient(levels))
+        self.curvature_transform = levels
+        self.cvf_field = field
+        self.cvf_components = to_components(field)
+        
+
 
     def _create_internal_system(self):
         self.log.debug("Generating internal energy system")
@@ -349,20 +438,28 @@ class Snake(object):
         if not self.normalize_contour_distance:
             return
         vertex_voxels = self.axes.map_to_axes(self.vertices)
-        distances = distance_transform_edt(1-self.voxelized)
-        DG = gvf.make_field_array(*gradient(distances))
-        direction = DG / field_magnitudes(DG, zero_to_one=True)[:,:,:,np.newaxis]
+        if self.normalize_contour_distance == 'euclidian':
+            distances = distance_transform_edt(1-self.voxelized)
+        else:
+            distances = self.curvature_transform
+
+        DG = to_field(*gradient(distances))
+        direction = normalize_field(DG)
+
         # Two-pass for memory reasons
         avg_dist = 0
+
         for v in vertex_voxels:
             avg_dist += distances[v]
         avg_dist /= len(vertex_voxels)
+
         for vertex, (x, y, z) in itertools.izip(self.vertices, vertex_voxels):
-            delta = avg_dist - distances[x,y,z]
-            vertex += delta * direction[x,y,z,:]
+            step = avg_dist - distances[x,y,z]
+            vertex += step * direction[x,y,z,:]
 
     def _reset(self):
         self.vertices = self.contour.vertices.copy()
+        self.iterations = 0
 
     @property
     def starting_points(self):
@@ -382,8 +479,10 @@ class Snake(object):
 
     def force(self):
         total_force = np.zeros(self.vertices.shape)
+        verices = self.vertices
+        vertex_voxels = self.axes.map_to_axes(vertices)
         for force in self.forces:
-            force_element = force(self.vertices)
+            force_element = force(vertices, vertex_voxels)
             total_force += force_element
         return total_force
 

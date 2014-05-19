@@ -114,3 +114,10 @@ def make_field_array(x, y, z, shape=None):
     return field
 
 
+def make_field_array(*components):
+    C = np.array(components)
+    D = len(C.shape)
+    F = np.rollaxis(C, 0, D)
+    return F
+
+
