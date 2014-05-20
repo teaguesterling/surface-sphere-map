@@ -113,12 +113,13 @@ class SurfaceForce(ContourForce):
         self._surface = surface
         self._image = image
         self._nearby_tris = {}
+        triangles = self._surface.triangles
 
         # TODO: This is waseful and sloppy
         for idx, faces in self._voxel_map.iteritems():
-            triangles = self._surface.triangles[faces]
-            normals = spatial.triangle_normals(triangles)
-            self._nearby_tris[idx] = triangles, normals
+            tris = triangles[faces]
+            normals = spatial.triangle_normals(tris)
+            self._nearby_tris[idx] = tris, normals
 
     def calculate_forces(self, mesh, voxels):
         forces = np.zeros(mesh.shape)
@@ -391,10 +392,12 @@ class Snake(object):
         raw_image = self.voxelized 
         shape = list(raw_image.shape) + [3]
         force = np.zeros(shape)
+        triangles = self.mesh.triangles
         
-        for idx, triangles in self.voxel_triangles.iteritems():
+        for idx, faces in self.voxel_triangles.iteritems():
             voxel = tuple(idx)
-            normal = spatial.triangle_normals(triangles).mean(axis=1)
+            tris = triangles[faces]
+            normal = spatial.triangle_normals(tris).mean(axis=1)
             force[voxel] = normal
 
 #        cu, cv, cw = map(laplace, gradient(raw_image, *self.axes.resolution))
