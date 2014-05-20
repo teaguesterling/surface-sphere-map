@@ -19,6 +19,7 @@ from scipy.ndimage.morphology import (
     distance_transform_edt,
     generate_binary_structure,
     binary_dilation,
+    binary_erosion,
 )
 from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import factorized
@@ -102,10 +103,11 @@ class FieldForce(ContourForce):
 
 
 class SurfaceForce(ContourForce):
-    def __init__(self, voxel_map, surface, scale=1.0, **kwargs):
+    def __init__(self, voxel_map, surface, image, scale=1.0, **kwargs):
         super(SurfaceForce, self).__init__(scale=scale, **kwargs)
         self._voxel_map = voxel_map
         self._surface = surface
+        self._image = image
         self._nearby_tris = {}
 
         # TODO: This is waseful and sloppy
@@ -118,18 +120,21 @@ class SurfaceForce(ContourForce):
         forces = np.zeros(mesh.shape)
         for idx, (vertex, voxel) in enumerate(itertools.izip(mesh, voxels)):
             voxel = tuple(voxel)
-            if voxel in self._nearby_tris:
+            if self._image[voxel]:
                 nearest, min_dist, inside = None, np.inf, False
                 nearby = self._nearby_tris[voxel]
-                for triangle, normal in nearby:
+                for triangle, normal in zip(*nearby):
                     dist, point = spatial.distance_to_triangle(vertex, triangle, with_point=True)
-                    if np.dot(normal, nearest - vertex) > 0:
+                    if np.dot(normal, point - vertex) > 0:
                         inside = True
                     if dist < min_dist:
                         nearest, min_dist = point, dist
                 forces[idx] = nearest - vertex
+
+                # Remove scaling for internal points
+                # Not optimal and prone to instability
                 if inside:
-                    forces[idx] /= self.scale
+                    forces[idx] /= self._scale
         return forces
 
 
@@ -137,25 +142,26 @@ class Snake(object):
 
     def __init__(self, mesh,
                        resolution=1,
-                       padding=20,
+                       padding=10,
                        contour_faces=None,
                        contour_size=None,
                        normalize_contour_distance=False,
-                       additional_normalization=10,
-                       blur_curvature=None,
+                       additional_normalization=0,
                        cvf_scale=1,
+                       cvf_blur=None,
                        gvf_scale=1,
                        gradient_scale=1,
                        snap_scale=1,
                        internal_scale=1,
-                       gvf_mode=None,
-                       smoothness=0.15,
+                       gvf_smoothness=0.15,
                        gvf_timestep=.75,
-                       numsteps=None,
-                       curvature_on_boundary=None,
+                       gvf_max_steps=None,
+                       gvf_curvature_on_boundary=None,
                        tension=0.1,
                        stiffness=0.1,
                        timestep=.2,
+                       epsilon=0.01,
+                       converge_on_snapping=True,
                        max_iterations=100,
                        log=logging):
         self.log = log
@@ -174,16 +180,15 @@ class Snake(object):
     
         # Curvature Force
         self.cvf_scale = cvf_scale
-        self.blur_curvature = blur_curvature
+        self.blur_curvature = cvf_blur
         self.min_curvature_propagation = 2
 
         # GVF Force
         self.gvf_scale = gvf_scale
-        self.gvf_mode = gvf_mode
-        self.smoothness = smoothness
+        self.smoothness = gvf_smoothness
         self.gvf_timestep = gvf_timestep
-        self.numsteps = numsteps
-        self.curvature_on_boundary = curvature_on_boundary
+        self.numsteps = gvf_max_steps
+        self.curvature_on_boundary = gvf_curvature_on_boundary
         self.normalize_force_after_distance = False
         
         # Scap Force
@@ -199,7 +204,8 @@ class Snake(object):
         self.iterations = 0
         self.timestep = timestep
         self.max_iterations = max_iterations
-        self.epsilon = 0.001
+        self.epsilon = epsilon
+        self.converge_on_snapping = converge_on_snapping
 
         self._translate_mesh()
         self._create_contour()
@@ -233,6 +239,7 @@ class Snake(object):
                 SurfaceForce(
                     voxel_map=self.voxel_triangles,
                     surface=self.mesh,
+                    image=self.voxelized,
                     scale=self.snap_scale*self.timestep))
 
     def _translate_mesh(self):
@@ -292,18 +299,18 @@ class Snake(object):
         ds = (self.resolution, self.resolution, self.resolution)
         raw_image = self.voxelized
         image = raw_image
-        if self.gvf_mode == 'ggvf':
-            u, v, w = gvf.reference_ggvf3d(image,
-                                           iter=self.numsteps,
-                                           K=self.smoothness,
-                                           dt=self.gvf_timestep,
-                                           ds=ds)
-        else:
-            u, v, w = gvf.reference_gvf3d(image,
-                                          iter=self.numsteps,
-                                          mu=self.smoothness,
-                                          dt=self.gvf_timestep,
-                                          ds=ds)
+#        if self.gvf_mode == 'ggvf':
+#            u, v, w = gvf.reference_ggvf3d(image,
+#                                           iter=self.numsteps,
+#                                           K=self.smoothness,
+#                                           dt=self.gvf_timestep,
+#                                          ds=ds)
+#       else:
+        u, v, w = gvf.reference_gvf3d(image,
+                                      iter=self.numsteps,
+                                      mu=self.smoothness,
+                                      dt=self.gvf_timestep,
+                                      ds=ds)
 
         if self.curvature_on_boundary == 0:
             mask = 1 - raw_image
@@ -362,16 +369,13 @@ class Snake(object):
 
         self.cdt_temp = levels
         
-        #dists = distance_transform_edt(1-image)
-        #dists[image > 0] = 0
-        #level = self._scale_curvature_level(dists, i-1)
-        #levels += level
-
         if self.blur_curvature:
             levels = gaussian_filter(levels, self.blur_curvature)
 
         field = -to_field(np.gradient(levels, *self.axes.resolution))
-        
+        mask = binary_erosion(image)
+        field[mask == 0] = 0
+        field[self.voxelized == 1] = 0
         self.curvature_transform = levels
         self.cvf_field = field
         self.cvf_components = to_components(field)
@@ -459,14 +463,14 @@ class Snake(object):
             deltas[i] = np.apply_along_axis(norm, 1, force_element).sum()
         return total_force, deltas
 
-    def apply_internal_force(self, vertices):
+    def relax_internal_force(self, vertices):
         new_vertices = np.apply_along_axis(self.apply_internal_force, 0, vertices)
         return new_vertices
 
     def update(self):
         forces, deltas = self.image_force()
         updated = self.vertices + forces
-        updates = self.apply_internal_force(updated)
+        updated = self.relax_internal_force(updated)
         delta = abs(self.vertices - updated).sum()
         self.vertices = updated
         self.iterations += 1
@@ -531,6 +535,92 @@ def dump_sphmap(stream, snake):
 def main(args, stdin=None, stdout=None):
     import sys
     parser = argparse.ArgumentParser
+    parser.add_argument('surface_file', 
+                        type=argparse.FileType('r'),
+                        default='-',
+                        help="Vet (MSRoll) file to map [Default: %(default)s]")
+    parser.add_argument('-r', '--voxel-resolution',
+                        type=float,
+                        default=1.0,
+                        help="Resolution at which to voxelize surface (in Angstroms) [Default: %(default)s]")
+    parser.add_argument('-p', '--voxel-padding',
+                        type=float,
+                        default=5.0,
+                        help="Padding to add to voxelized image [Default: %(default)s]")
+    parser.add_argument('-f', '--contour-faces',
+                        type=int,
+                        default=None,
+                        help="Number of faces to generate in contour [Default: >= source mesh]")
+    parser.add_argument('-r', '--contour-scale',
+                        type=float,
+                        default=1.0,
+                        help="Scale factor for contour [Default: %(default)s]")
+    parser.add_argument('-n', '--normalize-contour-distance',
+                        type=bool,
+                        default=False,
+                        help="Normalize contour distance to protein surface [Default: False]")
+    parser.add_argument('--timestep',
+                        type=float,
+                        default=.2,
+                        help="Global system timestep [Default: %(default)s]")
+    parser.add_argument('--cvf-scale',
+                        type=float,
+                        default=.5,
+                        help="Curvature Vector Flow scale factor [Default: %(default)s]")
+    parser.add_argument('--gvf-scale',
+                        type=float,
+                        default=1,
+                        help="Gradient Vector Flow scale factor [Default: %(default)s]")
+    parser.add_argument('--snap-scale',
+                        type=float,
+                        default=1,
+                        help="Surface snapping scale factor [Default: %(default)s]")
+    parser.add_argument('--internal-scale',
+                        type=float,
+                        default=1,
+                        help="Global internal energy scale factor [Default: %(default)s]")
+    parser.add_argument('--internal-tension',
+                        type=float,
+                        default=.2,
+                        help="Internal tension (elasticity) energy [Default: %(default)s]")
+    parser.add_argument('--internal-stiffness',
+                        type=float,
+                        default=.2,
+                        help="Internal stiffness (rigidity) energy [Default: %(default)s]")
+    parser.add_argument('--gvf-smoothness',
+                        type=float,
+                        default=.15,
+                        help="Gradient vector flow smoothness parameter [Default: %(default)s]")
+    parser.add_argument('--gvf-timestep',
+                        type=float,
+                        default=.75,
+                        help="Gradient vector flow generation timestep [Default: %(default)s]")
+    parser.add_argument('--gvf-max-steps',
+                        type=int,
+                        default=None,
+                        help="Gradient vector flow iterations [Default: Guessed]")
+    parser.add_argument('--gvf-curvature-on-boundary',
+                        type=bool,
+                        default=True,
+                        help="Augment GVF field with balancing boundary term [Default: %(default)s]")
+    parser.add_argument('--gvf-curvature-on-boundary',
+                        type=bool,
+                        default=True,
+                        help="Augment GVF field with balancing boundary term [Default: %(default)s]")
+    parser.add_argument('--convergence-threshold',
+                        type=float,
+                        default=0.001,
+                        help="Average movement threshold for termination [Default: %(default)s]")
+    parser.add_argument('--converge-on-snapping',
+                        type=bool,
+                        default=True,
+                        help="Only consider snapping in convergence [Default: %(default)s]")
+    parser.add_argument('--max-iterations',
+                        type=int,
+                        default=200,
+                        help="Maxiumum number of iterations to run before forced termination [Default: %(default)s]")
+                    
+                        
 
 
 if __name__ == '__main__':
