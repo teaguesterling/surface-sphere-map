@@ -509,7 +509,7 @@ class Snake(object):
         deltas = np.zeros(len(self.forces))
         active_forces = self.forces
         if active is not None:
-            active_forces = [f for i,f in active_forces if i in active]
+            active_forces = [f for i,f in enumerate(active_forces) if i in active]
         for i, force in enumerate(active_forces):
             force_element = force(vertices, vertex_voxels)
             total_force += force_element
@@ -534,7 +534,7 @@ class Snake(object):
         delta = abs(self.vertices - updated).sum()
         self.vertices = updated
         self.iterations += 1
-        self.log.info("Step {0}: {1:.0f} total, {2:.3f} average ({3})".format(
+        self.log.info("Step {0}: {1:.1f} total, {2:.3f} average ({3})".format(
                         self.iterations,
                         delta,
                         delta / len(self.vertices),
@@ -558,33 +558,33 @@ class Snake(object):
 
     def mapping_accuracy(self):
         # Find number of vertices in surface voxel
-        voxels = self.axes.map_to_axes(self.vertices)
-        on_surface = self.voxelized[voxels].sum()
-        total = len(voxels)
-        self.log.info("{0} of {1} vertices in surface voxel ({2:.2f})".format(
-                        on_surface, total, on_surface / total))
+        voxels = itertools.imap(tuple, self.axes.map_to_axes(self.vertices))
+        surface = self.voxelized
+        on_surface = int(reduce(np.add, (surface[voxel] for voxel in voxels)))
+        total = len(self.vertices)
+        self.log.info("{0} of {1} vertices in surface voxel ({2:.1f}%)".format(
+                        on_surface, total, (on_surface / total)*100))
 
         # Find total distance of voxels to surface
-        vectors_to_surface = self.image_force(active=3)
-        distance_to_surface = np.apply_along_axis(norm, 1, vectors_to_surface)
+        _force, distance_to_surface = self.image_force(active=[3])
         total_distance = distance_to_surface.sum()
         self.log.info("{0} total angstroms off surface for 'on' voxels".format(
                         total_distance))
 
         mesh_offset = 0
         search_limit = 10
-        left_out = 0
-        self.log.debug("Computing mesh to contour offset...")
+        leftout = 0
+        self.log.debug("Computing mesh to contour offset... (this may take a while)")
         for vertex in self.mesh.vertices:
             dist, _t, pt = self.contour.nearest_surface_point(vertex, 
                                                               search_limit=search_limit)
             if pt is None:
-                left_out += 1
-                dist += search_limit
+                leftout += 1
+                dist = search_limit
             
             mesh_offset += dist
         self.log.info("Total distance from mesh to contour: {0:.2f}".format(mesh_offset))
-        self.log.info("{0} points not found in search range of {1}".format(leftout, search_range))
+        self.log.info("{0} points not found in search range of {1}".format(leftout, search_limit))
         return (on_surface, total), total_distance, mesh_offset 
 
 
@@ -649,35 +649,37 @@ def show_mapping(contour):
 
 def main(args, stdin=None, stdout=None):
     import sys
-    parser = argparse.ArgumentParser
+    parser = argparse.ArgumentParser()
     parser.add_argument('surface_file', 
                         type=argparse.FileType('r'),
                         default='-',
+                        nargs='?',
                         help="Vet (MSRoll) file to map [Default: %(default)s]")
     parser.add_argument('mapping_file',
                         type=argparse.FileType('w'),
                         default='-',
+                        nargs='?',
                         help="Destination to write sphere mapping [Default: %(default)s]")
 
-    parser.add_argument('-r', '--voxel-resolution',
+    parser.add_argument('--voxel-resolution',
                         type=float,
-                        default=1.0,
+                        default=.75,
                         help="Resolution at which to voxelize surface (in Angstroms) [Default: %(default)s]")
-    parser.add_argument('-p', '--voxel-padding',
+    parser.add_argument('--voxel-padding',
                         type=float,
-                        default=10.0,
+                        default=5.0,
                         help="Padding to add to voxelized image [Default: %(default)s]")
-    parser.add_argument('-f', '--contour-faces',
+    parser.add_argument('--contour-faces',
                         type=int,
                         default=None,
                         help="Number of faces to generate in contour [Default: >= source mesh]")
-    parser.add_argument('-r', '--contour-scale',
+    parser.add_argument('--contour-scale',
                         type=float,
                         default=1.0,
                         help="Scale factor for contour [Default: %(default)s]")
-    parser.add_argument('-n', '--normalize-contour-distance',
+    parser.add_argument('--normalize-contour-distance',
                         type=bool,
-                        default=False,
+                        default=True,
                         help="Normalize contour distance to protein surface [Default: False] (Warning: May require signifigant padding!)")
     parser.add_argument('--timestep',
                         type=float,
@@ -685,7 +687,7 @@ def main(args, stdin=None, stdout=None):
                         help="Global system timestep [Default: %(default)s]")
     parser.add_argument('--cvf-scale',
                         type=float,
-                        default=.5,
+                        default=.75,
                         help="Curvature Vector Flow scale factor [Default: %(default)s]")
     parser.add_argument('--gvf-scale',
                         type=float,
@@ -709,7 +711,7 @@ def main(args, stdin=None, stdout=None):
                         help="Internal tension (elasticity) energy [Default: %(default)s]")
     parser.add_argument('--internal-stiffness',
                         type=float,
-                        default=.25,
+                        default=.35,
                         help="Internal stiffness (rigidity) energy [Default: %(default)s]")
     parser.add_argument('--gvf-smoothness',
                         type=float,
@@ -723,11 +725,11 @@ def main(args, stdin=None, stdout=None):
                         type=int,
                         default=None,
                         help="Gradient vector flow iterations [Default: Guessed]")
-    parser.add_argument('--gvf-normalize_distance',
+    parser.add_argument('--gvf-normalize-distance',
                         type=float,
-                        default=10,
+                        default=12,
                         help="Normalize GVF after Euclidian distance from surface term [Default: %(default)s]")
-    parser.add_argument('--gvf-normalize_distance',
+    parser.add_argument('--cvf-normalize-distance',
                         type=float,
                         default=15,
                         help="Normalize CVF after Euclidian distance from surface term [Default: %(default)s]")
@@ -764,25 +766,25 @@ def main(args, stdin=None, stdout=None):
         total_iterations = params.max_iterations
 
     contour = Snake(source,
-                resolution=params.resolution,
-                padding=params.padding,
+                resolution=params.voxel_resolution,
+                padding=params.voxel_padding,
                 contour_faces=params.contour_faces,
-                contour_size=params.contour_size,
+                contour_size=params.contour_scale,
                 normalize_contour_distance=params.normalize_contour_distance,
                 push_scale=params.push_scale,
                 gvf_scale=params.gvf_scale,
                 cvf_scale=params.cvf_scale,
-                cvf_normalize_distance=params.cvf_normalize_distance,
+                cvf_normalize_threshold=params.cvf_normalize_distance,
                 snap_scale=params.snap_scale,
                 internal_scale=params.internal_scale,
                 gvf_smoothness=params.gvf_smoothness,
                 gvf_timestep=params.gvf_timestep,
                 gvf_max_steps=params.gvf_max_steps,
-                gvf_normalize_distance=params.gvf_normalize_distance,
+                gvf_normalize_threshold=params.gvf_normalize_distance,
                 tension=params.internal_tension,
                 stiffness=params.internal_stiffness,
                 timestep=params.timestep,
-                epsilon=params.epsilon,
+                epsilon=params.convergence_threshold,
                 max_iterations=params.max_iterations)
 
     while contour.max_iterations > total_iterations:
