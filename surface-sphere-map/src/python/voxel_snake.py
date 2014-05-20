@@ -153,12 +153,14 @@ class Snake(object):
                        normalize_contour_distance=False,
                        additional_normalization=0,
                        push_scale=1,
+                       reduce_push_scale_step=0,
                        cvf_scale=1,
                        cvf_blur=None,
                        gvf_scale=1,
                        cvf_normalize_threshold=0,
                        gradient_scale=1,
                        snap_scale=1,
+                       snap_at_stop=True,
                        internal_scale=1,
                        gvf_smoothness=0.15,
                        gvf_timestep=.75,
@@ -201,9 +203,11 @@ class Snake(object):
         
         # Scap Force
         self.snap_scale = snap_scale
+        self.snap_at_stopping = snap_at_stop
 
         # Push Force
         self.push_scale = push_scale
+        self.reduce_push_scale_step = reduce_push_scale_step
 
         # Internal Force
         self.tension = tension
@@ -219,40 +223,40 @@ class Snake(object):
         self.epsilon = epsilon
         self.converge_on_snapping = converge_on_snapping
 
-        self._translate_mesh()
+        self._analyze_mesh()
         self._create_contour()
         self._create_grid()
         self._voxelize_mesh()
         self._create_internal_system()
-        self._create_boundary_curvature()
+        self._create_boundary_force()
         self._calculate_gvf()
         self._calculate_cvf()
 
-        self._normalize_distance()
+        if self.normalize_contour_distance:
+            self._normalize_distance()
 
         self.forces = []
-
         self.log.debug("Creating and pre-caching forces")
 
-        if self.gvf_scale is not None:
+        if self.gvf_scale is not None and self.gvf_scale > 0:
             self.forces.append(
                 FieldForce(
                     field=self.gvf_field, 
                     scale=self.gvf_scale*self.timestep))
 
-        if self.cvf_scale is not None:
+        if self.cvf_scale is not None and self.cvf_scale > 0:
             self.forces.append(
                 FieldForce(
                     field=self.cvf_field, 
                     scale=self.cvf_scale*self.timestep))
         
-        if self.push_scale is not None:
+        if self.push_scale is not None and self.push_scale > 0:
             self.forces.append(
                 FieldForce(
                     field=self.boundary_push_field,
                     scale=self.push_scale*self.timestep))
 
-        if self.snap_scale is not None:
+        if self.snap_scale is not None and self.snap_scale > 0:
             self.forces.append(
                 SurfaceForce(
                     voxel_map=self.voxel_triangles,
@@ -261,8 +265,8 @@ class Snake(object):
                     scale=self.snap_scale*self.timestep))
 
 
-    def _translate_mesh(self):
-        self.log.debug("Repositioning source mesh")
+    def _analyze_mesh(self):
+        self.log.debug("Analyzing source mesh")
         low = self.original_mesh.vertices.min(axis=0)
         high = self.original_mesh.vertices.max(axis=0)
         center = (low + high) / 2
@@ -348,7 +352,6 @@ class Snake(object):
         self.gvf_components = to_components(gvf_field)
         self.gvf_field = gvf_field
 
-
     def _scale_curvature_level(self, level, index):
         level[level > 0] = index + 1
         return level
@@ -398,10 +401,11 @@ class Snake(object):
             cvf_field = cvf_field * mask
 
         self.curvature_transform = levels
-        self.cvf_field = field
-        self.cvf_components = to_components(field)
+        self.cvf_field = cvf_field
+        self.cvf_components = to_components(cvf_field)
 
-    def _create_boundary_curvature(self):
+    def _create_boundary_force(self):
+        self.log.debug("Generating outward boundary force")
         raw_image = self.voxelized 
         shape = list(raw_image.shape) + [3]
         force = np.zeros(shape)
@@ -443,9 +447,6 @@ class Snake(object):
         self.apply_internal_force = solver
 
     def _normalize_distance(self):
-        if not self.normalize_contour_distance:
-            return
-
         self.log.debug("Normalizing contour distribution over distance")
         vertex_voxels = self.axes.map_to_axes(self.vertices)
 
@@ -470,8 +471,9 @@ class Snake(object):
 
         # Bring back inside bounds
         i = 0
+        dummy_external = np.zeros((len(self.vertices), 3))
         while i < 100 and not self.axes.all_points_in_grid(self.vertices):
-            self.vertices = self.relax_internal_force(self.vertices)
+            self.vertices = self.relax_internal_force(self.vertices, dummy_external)
             i += 1
         if i >= 100:
             print("Overload!")
@@ -492,25 +494,27 @@ class Snake(object):
     def unit_starting_points(self):
         return self.contour.unit_vertices
 
-    def image_force(self):
+    def image_force(self, active=None):
         total_force = np.zeros(self.vertices.shape)
         vertices = self.vertices
         vertex_voxels = self.axes.map_to_axes(vertices)
         deltas = np.zeros(len(self.forces))
-        for i, force in enumerate(self.forces):
+        active_forces = self.forces
+        if indicies is not None:
+            active_forces = [f for i,f in active_forces if i in active]
+        for i, force in enumerate(active_forces):
             force_element = force(vertices, vertex_voxels)
             total_force += force_element
             deltas[i] = np.apply_along_axis(norm, 1, force_element).sum()
         return total_force, deltas
 
-    def relax_internal_force(self, vertices, external):
+    def relax_internal_force(self, vertices, external, remove_external=True):
         new_vertices = np.apply_along_axis(self.apply_internal_force, 0, vertices)
-        if self.remove_external_component:
+        if self.remove_external_component and remove_external:
             raise NotImplementedError
             magnitudes = np.apply_along_axis(norm, 1, external)
             magnitudes[magnitudes==0] = 1
             directions = external / magnitudes[:,np.newaxis]
-            
         return new_vertices
 
     def update(self):
@@ -520,9 +524,11 @@ class Snake(object):
         delta = abs(self.vertices - updated).sum()
         self.vertices = updated
         self.iterations += 1
-        self.log.info("Step {0} deltas ({1} total): {2}".format(self.iterations,
-                                                                delta,
-                                                                deltas))
+        self.log.info("Step {0}: {1:.0f} total, {2:.3f} average ({3})".format(
+                        self.iterations,
+                        delta,
+                        delta / len(self.vertices),
+                        " ".join("{:.1f}".format(d) for d in deltas)))
         return delta, deltas
 
     def run(self):
@@ -535,6 +541,41 @@ class Snake(object):
             # Step towards image
             change, force_changes = self.update()
             delta = change / N
+
+        if self.snap_at_stopping:
+            snap, movement = self.image_force(active=[3])
+            self.vertices += snap
+
+    def mapping_accuracy(self):
+        # Find number of vertices in surface voxel
+        voxels = self.axes.map_to_axes(self.vertices)
+        on_surface = self.voxelized[voxels].sum()
+        total = len(voxels)
+        self.log.info("{0} of {1} vertices in surface voxel ({2:.2f})".format(
+                        on_surface, total, on_surface / total))
+
+        # Find total distance of voxels to surface
+        vectors_to_surface = self.image_force(active=3)
+        distance_to_surface = np.apply_along_axis(norm, 1, vectors_to_surface)
+        total_distance = distance_to_surface.sum()
+        self.log.info("{0} total angstroms off surface for 'on' voxels".format(
+                        total_distance))
+
+        mesh_offset = 0
+        search_limit = 10
+        left_out = 0
+        self.log.debug("Computing mesh to contour offset...")
+        for vertex in self.mesh.vertices:
+            dist, _t, pt = self.contour.nearest_surface_point(vertex, 
+                                                              search_limit=search_limit)
+            if pt is None:
+                left_out += 1
+                dist += search_limit
+            
+            mesh_offset += dist
+        self.log.info("Total distance from mesh to contour: {0:.2f}".format(mesh_offset))
+        self.log.info("{0} points not found in search range of {1}".format(leftout, search_range))
+        return (on_surface, total), total_distance, mesh_offset 
 
 
 def load_sphmap(stream):
@@ -630,15 +671,15 @@ def main(args, stdin=None, stdout=None):
                         help="Normalize contour distance to protein surface [Default: False] (Warning: May require signifigant padding!)")
     parser.add_argument('--timestep',
                         type=float,
-                        default=.2,
+                        default=.15,
                         help="Global system timestep [Default: %(default)s]")
     parser.add_argument('--cvf-scale',
                         type=float,
-                        default=1,
+                        default=.5,
                         help="Curvature Vector Flow scale factor [Default: %(default)s]")
     parser.add_argument('--gvf-scale',
                         type=float,
-                        default=.75,
+                        default=.5,
                         help="Gradient Vector Flow scale factor [Default: %(default)s]")
     parser.add_argument('--push-scale',
                         type=float,
@@ -654,7 +695,7 @@ def main(args, stdin=None, stdout=None):
                         help="Global internal energy scale factor [Default: %(default)s]")
     parser.add_argument('--internal-tension',
                         type=float,
-                        default=.25,
+                        default=.5,
                         help="Internal tension (elasticity) energy [Default: %(default)s]")
     parser.add_argument('--internal-stiffness',
                         type=float,
@@ -674,11 +715,15 @@ def main(args, stdin=None, stdout=None):
                         help="Gradient vector flow iterations [Default: Guessed]")
     parser.add_argument('--gvf-normalize_distance',
                         type=float,
-                        default=5,
+                        default=10,
                         help="Normalize GVF after Euclidian distance from surface term [Default: %(default)s]")
+    parser.add_argument('--gvf-normalize_distance',
+                        type=float,
+                        default=15,
+                        help="Normalize CVF after Euclidian distance from surface term [Default: %(default)s]")
     parser.add_argument('--convergence-threshold',
                         type=float,
-                        default=0.001,
+                        default=0.015,
                         help="Average movement threshold for termination [Default: %(default)s]")
     parser.add_argument('--converge-on-snapping',
                         type=bool,
@@ -686,7 +731,7 @@ def main(args, stdin=None, stdout=None):
                         help="Only consider snapping in convergence [Default: %(default)s]")
     parser.add_argument('--max-iterations',
                         type=int,
-                        default=200,
+                        default=500,
                         help="Maxiumum number of iterations to run before forced termination [Default: %(default)s]")
 
     parser.add_argument('--visualize',
@@ -717,6 +762,7 @@ def main(args, stdin=None, stdout=None):
                 push_scale=params.push_scale,
                 gvf_scale=params.gvf_scale,
                 cvf_scale=params.cvf_scale,
+                cvf_normalize_distance=params.cvf_normalize_distance,
                 snap_scale=params.snap_scale,
                 internal_scale=params.internal_scale,
                 gvf_smoothness=params.gvf_smoothness,

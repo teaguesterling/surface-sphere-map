@@ -147,7 +147,6 @@ class Surface(object):
         distance, triangle, nearest_point = nearest_triangle(point, triangles)
         return distance, triangle, nearest_point
 
-    # UNUSED
     def get_faces_near(self, point, search_limit=None):
         if search_limit is not None:
             vertex_indexes = self.space.query_ball_point(point, search_limit)
