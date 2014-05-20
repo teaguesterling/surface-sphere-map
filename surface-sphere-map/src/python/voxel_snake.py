@@ -156,6 +156,7 @@ class Snake(object):
                        cvf_scale=1,
                        cvf_blur=None,
                        gvf_scale=1,
+                       cvf_normalize_threshold=0,
                        gradient_scale=1,
                        snap_scale=1,
                        internal_scale=1,
@@ -165,6 +166,7 @@ class Snake(object):
                        gvf_normalize_threshold=0,
                        tension=0.1,
                        stiffness=0.1,
+                       remove_external_from_internal=False,
                        timestep=.2,
                        epsilon=0.01,
                        converge_on_snapping=True,
@@ -188,6 +190,7 @@ class Snake(object):
         self.cvf_scale = cvf_scale
         self.blur_curvature = cvf_blur
         self.min_curvature_propagation = 2
+        self.normalize_cvf_distance = cvf_normalize_threshold
 
         # GVF Force
         self.gvf_scale = gvf_scale
@@ -205,6 +208,7 @@ class Snake(object):
         # Internal Force
         self.tension = tension
         self.stiffness = stiffness
+        self.remove_external_component = remove_external_from_internal
 
         # Force scaling
         self.internal_scale = internal_scale
@@ -351,7 +355,8 @@ class Snake(object):
 
     def _calculate_cvf(self):
         self.log.debug("Generating Curvature Flow")
-        image = self.voxelized.copy()
+        raw_image = self.voxelized
+        image = raw_image.copy()
         max_steps = 3*max(image.shape)
         min_grow_curvature = self.min_curvature_propagation
         levels = image.copy()
@@ -378,11 +383,19 @@ class Snake(object):
         if self.blur_curvature:
             levels = gaussian_filter(levels, self.blur_curvature)
 
-        field = -to_field(np.gradient(levels, *self.axes.resolution))
+        cvf_field = -to_field(np.gradient(levels, *self.axes.resolution))
         mask = binary_erosion(image)
-        field[mask == 0] = 0
-        field[self.voxelized == 1] = 0
+        cvf_field[mask == 0] = 0
+        cvf_field[self.voxelized == 1] = 0
 
+        if self.normalize_cvf_distance > 0:
+            speed = 10
+            thresh = self.normalize_cvf_distance
+            Minv = 1 / field_magnitudes(cvf_field, zero_to_one=True)[:,:,:,np.newaxis]
+            D = distance_transform_edt(1-raw_image)
+            H = .5 + .5 * np.tanh(speed * (D - thresh))
+            mask = 1 + H[:,:,:,np.newaxis] * (Minv - 1)
+            cvf_field = cvf_field * mask
 
         self.curvature_transform = levels
         self.cvf_field = field
@@ -458,7 +471,7 @@ class Snake(object):
         # Bring back inside bounds
         i = 0
         while i < 100 and not self.axes.all_points_in_grid(self.vertices):
-            self.vertices = self.apply_internal_force(self.vertices)
+            self.vertices = self.relax_internal_force(self.vertices)
             i += 1
         if i >= 100:
             print("Overload!")
@@ -490,14 +503,20 @@ class Snake(object):
             deltas[i] = np.apply_along_axis(norm, 1, force_element).sum()
         return total_force, deltas
 
-    def relax_internal_force(self, vertices):
+    def relax_internal_force(self, vertices, external):
         new_vertices = np.apply_along_axis(self.apply_internal_force, 0, vertices)
+        if self.remove_external_component:
+            raise NotImplementedError
+            magnitudes = np.apply_along_axis(norm, 1, external)
+            magnitudes[magnitudes==0] = 1
+            directions = external / magnitudes[:,np.newaxis]
+            
         return new_vertices
 
     def update(self):
         forces, deltas = self.image_force()
         updated = self.vertices + forces
-        updated = self.relax_internal_force(updated)
+        updated = self.relax_internal_force(updated, forces)
         delta = abs(self.vertices - updated).sum()
         self.vertices = updated
         self.iterations += 1
