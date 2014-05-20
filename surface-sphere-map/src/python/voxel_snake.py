@@ -397,7 +397,7 @@ class Snake(object):
         for idx, faces in self.voxel_triangles.iteritems():
             voxel = tuple(idx)
             tris = triangles[faces]
-            normal = spatial.triangle_normals(tris).mean(axis=1)
+            normal = spatial.triangle_normals(tris).mean(axis=0)
             force[voxel] = normal
 
 #        cu, cv, cw = map(laplace, gradient(raw_image, *self.axes.resolution))
