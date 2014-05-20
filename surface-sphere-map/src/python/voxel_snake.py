@@ -37,6 +37,10 @@ from mayavi import mlab
 logging.basicConfig(level=logging.DEBUG)
 
 
+def triangle_args(surface):
+    return list(surface.vertices.transpose()) + [surface.faces]
+
+
 @contextlib.contextmanager
 def numpy_error_handling(**settings):
     old_settings = np.seterr(**settings)
@@ -147,6 +151,7 @@ class Snake(object):
                        contour_size=None,
                        normalize_contour_distance=False,
                        additional_normalization=0,
+                       push_scale=1,
                        cvf_scale=1,
                        cvf_blur=None,
                        gvf_scale=1,
@@ -156,7 +161,7 @@ class Snake(object):
                        gvf_smoothness=0.15,
                        gvf_timestep=.75,
                        gvf_max_steps=None,
-                       gvf_curvature_on_boundary=None,
+                       gvf_normalize_threshold=0,
                        tension=0.1,
                        stiffness=0.1,
                        timestep=.2,
@@ -188,11 +193,13 @@ class Snake(object):
         self.smoothness = gvf_smoothness
         self.gvf_timestep = gvf_timestep
         self.numsteps = gvf_max_steps
-        self.curvature_on_boundary = gvf_curvature_on_boundary
-        self.normalize_force_after_distance = False
+        self.normalize_gvf_distance = gvf_normalize_threshold
         
         # Scap Force
         self.snap_scale = snap_scale
+
+        # Push Force
+        self.push_scale = push_scale
 
         # Internal Force
         self.tension = tension
@@ -211,12 +218,12 @@ class Snake(object):
         self._create_contour()
         self._create_grid()
         self._voxelize_mesh()
-        self._normalize_distance()
         self._create_internal_system()
+        self._create_boundary_curvature()
         self._calculate_gvf()
         self._calculate_cvf()
 
-
+        self._normalize_distance()
 
         self.forces = []
 
@@ -234,6 +241,12 @@ class Snake(object):
                     field=self.cvf_field, 
                     scale=self.cvf_scale*self.timestep))
         
+        if self.push_scale is not None:
+            self.forces.append(
+                FieldForce(
+                    field=self.boundary_push_field,
+                    scale=self.push_scale*self.timestep))
+
         if self.snap_scale is not None:
             self.forces.append(
                 SurfaceForce(
@@ -241,6 +254,7 @@ class Snake(object):
                     surface=self.mesh,
                     image=self.voxelized,
                     scale=self.snap_scale*self.timestep))
+
 
     def _translate_mesh(self):
         self.log.debug("Repositioning source mesh")
@@ -312,24 +326,14 @@ class Snake(object):
                                       dt=self.gvf_timestep,
                                       ds=ds)
 
-        if self.curvature_on_boundary == 0:
-            mask = 1 - raw_image
-            u, v, w, = u * mask, v * mask , w * mask
-        elif self.curvature_on_boundary is not None:
-            cu, cv, cw = map(laplace, gradient(raw_image, *self.axes.resolution))
-            mask = 1 - self.voxelized
-            u += cu * mask * self.curvature_on_boundary
-            v += cv * mask * self.curvature_on_boundary
-            w += cw * mask * self.curvature_on_boundary
-            
+        mask = 1 - raw_image
+        u, v, w, = u * mask, v * mask , w * mask
         gvf_field = gvf.make_field_array(u, v, w)
         self._raw_field = gvf_field
 
-        if self.normalize_force_after_distance == 0:
-            gvf_field /= field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
-        elif self.normalize_force_after_distance is not None:
+        if self.normalize_gvf_distance > 0:
             speed = 10
-            thresh = self.normalize_force_after_distance
+            thresh = self.normalize_gvf_distance
             Minv = 1 / field_magnitudes(gvf_field, zero_to_one=True)[:,:,:,np.newaxis]
             D = distance_transform_edt(1-raw_image)
             H = .5 + .5 * np.tanh(speed * (D - thresh))
@@ -338,6 +342,7 @@ class Snake(object):
             
         self.gvf_components = to_components(gvf_field)
         self.gvf_field = gvf_field
+
 
     def _scale_curvature_level(self, level, index):
         level[level > 0] = index + 1
@@ -376,9 +381,28 @@ class Snake(object):
         mask = binary_erosion(image)
         field[mask == 0] = 0
         field[self.voxelized == 1] = 0
+
+
         self.curvature_transform = levels
         self.cvf_field = field
         self.cvf_components = to_components(field)
+
+    def _create_boundary_curvature(self):
+        raw_image = self.voxelized 
+        shape = list(raw_image.shape) + [3]
+        force = np.zeros(shape)
+        
+        for idx, triangles in self.voxel_triangles.iteritems():
+            voxel = tuple(idx)
+            normal = spatial.triangle_normals(triangles).mean(axis=1)
+            force[voxel] = normal
+
+#        cu, cv, cw = map(laplace, gradient(raw_image, *self.axes.resolution))
+#        mask = raw_image
+#        push_force = np.array([cu, cv, cw]).transpose()
+
+#        push_force[raw_image == 0] = np.zeros(3)
+        self.boundary_push_field = force
 
     def _create_internal_system(self):
         self.log.debug("Generating internal energy system")
@@ -532,6 +556,24 @@ def dump_sphmap(stream, snake):
         print(format.format(*line), file=stream)
 
 
+def show_travel(contour):
+    from mayavi import mlab
+    mlab.triangle_mesh(*triangle_args(contour), 
+                        opacity=.75, 
+                        scalars=contour.travel,
+                        color='PUGr')
+    mlab.clf()
+    mlab.triangle_mesh(*triangle_args(contour.mesh), opacity=.25, color='Bone')
+    mlab.show()
+
+
+def show_mapping(contour):
+    from mayavi import mlab
+    mlab.clf()
+    mlab.triangle_mesh(*triangle_args(contour.contour), scalars=contour.travel)
+    mlab.show()
+
+
 def main(args, stdin=None, stdout=None):
     import sys
     parser = argparse.ArgumentParser
@@ -539,13 +581,18 @@ def main(args, stdin=None, stdout=None):
                         type=argparse.FileType('r'),
                         default='-',
                         help="Vet (MSRoll) file to map [Default: %(default)s]")
+    parser.add_argument('mapping_file',
+                        type=argparse.FileType('w'),
+                        default='-',
+                        help="Destination to write sphere mapping [Default: %(default)s]")
+
     parser.add_argument('-r', '--voxel-resolution',
                         type=float,
                         default=1.0,
                         help="Resolution at which to voxelize surface (in Angstroms) [Default: %(default)s]")
     parser.add_argument('-p', '--voxel-padding',
                         type=float,
-                        default=5.0,
+                        default=10.0,
                         help="Padding to add to voxelized image [Default: %(default)s]")
     parser.add_argument('-f', '--contour-faces',
                         type=int,
@@ -558,19 +605,23 @@ def main(args, stdin=None, stdout=None):
     parser.add_argument('-n', '--normalize-contour-distance',
                         type=bool,
                         default=False,
-                        help="Normalize contour distance to protein surface [Default: False]")
+                        help="Normalize contour distance to protein surface [Default: False] (Warning: May require signifigant padding!)")
     parser.add_argument('--timestep',
                         type=float,
                         default=.2,
                         help="Global system timestep [Default: %(default)s]")
     parser.add_argument('--cvf-scale',
                         type=float,
-                        default=.5,
+                        default=1,
                         help="Curvature Vector Flow scale factor [Default: %(default)s]")
     parser.add_argument('--gvf-scale',
                         type=float,
-                        default=1,
+                        default=.75,
                         help="Gradient Vector Flow scale factor [Default: %(default)s]")
+    parser.add_argument('--push-scale',
+                        type=float,
+                        default=1,
+                        help="Boundary push scale factor [Default: %(default)s]")
     parser.add_argument('--snap-scale',
                         type=float,
                         default=1,
@@ -581,11 +632,11 @@ def main(args, stdin=None, stdout=None):
                         help="Global internal energy scale factor [Default: %(default)s]")
     parser.add_argument('--internal-tension',
                         type=float,
-                        default=.2,
+                        default=.25,
                         help="Internal tension (elasticity) energy [Default: %(default)s]")
     parser.add_argument('--internal-stiffness',
                         type=float,
-                        default=.2,
+                        default=.25,
                         help="Internal stiffness (rigidity) energy [Default: %(default)s]")
     parser.add_argument('--gvf-smoothness',
                         type=float,
@@ -599,29 +650,79 @@ def main(args, stdin=None, stdout=None):
                         type=int,
                         default=None,
                         help="Gradient vector flow iterations [Default: Guessed]")
-    parser.add_argument('--gvf-curvature-on-boundary',
-                        type=bool,
-                        default=True,
-                        help="Augment GVF field with balancing boundary term [Default: %(default)s]")
-    parser.add_argument('--gvf-curvature-on-boundary',
-                        type=bool,
-                        default=True,
-                        help="Augment GVF field with balancing boundary term [Default: %(default)s]")
+    parser.add_argument('--gvf-normalize_distance',
+                        type=float,
+                        default=5,
+                        help="Normalize GVF after Euclidian distance from surface term [Default: %(default)s]")
     parser.add_argument('--convergence-threshold',
                         type=float,
                         default=0.001,
                         help="Average movement threshold for termination [Default: %(default)s]")
     parser.add_argument('--converge-on-snapping',
                         type=bool,
-                        default=True,
+                        default=False,
                         help="Only consider snapping in convergence [Default: %(default)s]")
     parser.add_argument('--max-iterations',
                         type=int,
                         default=200,
                         help="Maxiumum number of iterations to run before forced termination [Default: %(default)s]")
-                    
-                        
 
+    parser.add_argument('--visualize',
+                        choices=('convergence', 'mapping', 'none'),
+                        default='none',
+                        help="Display visualization (Requires MayaVI) [Default: none]")
+    parser.add_argument('--visualize-every',
+                        type=int,
+                        default=None,
+                        help="Interrupt iterations to visualize every N steps [Default: %(default)s]")
+    params = parser.parse_args(args)
+
+    source = spatial.Surface.from_vet_file(params.surface_file)
+
+    if params.visualize_every is not None:
+        max_step = params.visualize_every
+        total_iterations = params.max_iterations
+        params.max_iterations = max_step
+    else:
+        total_iterations = params.max_iterations
+
+    contour = Snake(source,
+                resolution=params.resolution,
+                padding=params.padding,
+                contour_faces=params.contour_faces,
+                contour_size=params.contour_size,
+                normalize_contour_distance=params.normalize_contour_distance,
+                push_scale=params.push_scale,
+                gvf_scale=params.gvf_scale,
+                cvf_scale=params.cvf_scale,
+                snap_scale=params.snap_scale,
+                internal_scale=params.internal_scale,
+                gvf_smoothness=params.gvf_smoothness,
+                gvf_timestep=params.gvf_timestep,
+                gvf_max_steps=params.gvf_max_steps,
+                gvf_normalize_distance=params.gvf_normalize_distance,
+                tension=params.internal_tension,
+                stiffness=params.internal_stiffness,
+                timestep=params.timestep,
+                epsilon=params.epsilon,
+                max_iterations=params.max_iterations)
+
+    while contour.max_iterations > total_iterations:
+        contour.run()
+        if params.visualize_every is not None:
+            contour.max_iteratons += max_step
+            if params.visualize == 'convergence':
+                show_travel(contour)
+            elif params.visualize == 'mapping':
+                show_mapping(contour)
+
+    dump_sphmap(params.mapping_file, contour)
+    
+    if params.visualize == 'convergence':
+        show_travel(contour)
+    elif params.visualize == 'mapping':
+        show_mapping(contour)
+                        
 
 if __name__ == '__main__':
     import sys
