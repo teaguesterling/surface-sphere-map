@@ -498,9 +498,9 @@ class Snake(object):
         r = self.contour_radius
         coords = np.zeros((len(self.vertices), 2))
         xs, ys, zs  = self.vertices.transpose()
-        sph_coords[0,:] = np.arccos(zs / r)
-        sph_coords[1,:] = np.arctan2(ys, xz)
-        return sph_coords
+        coords[:,0] = np.arccos(zs / r)
+        coords[:,1] = np.arctan2(ys, xs)
+        return coords
 
     def image_force(self, active=None):
         total_force = np.zeros(self.vertices.shape)
@@ -629,21 +629,25 @@ def dump_sphmap(stream, snake):
         print(format.format(*line), file=stream)
 
 
-def show_travel(contour):
+def show_travel(contour, output):
     from mayavi import mlab
-    mlab.triangle_mesh(*triangle_args(contour), 
+    mlab.clf()
+    mlab.triangular_mesh(*triangle_args(contour), 
                         opacity=.75, 
                         scalars=contour.travel,
-                        color='PUGr')
-    mlab.clf()
-    mlab.triangle_mesh(*triangle_args(contour.mesh), opacity=.25, color='Bone')
+                        colormap='PRGn')
+    mlab.triangular_mesh(*triangle_args(contour.mesh), opacity=.25, colormap='OrRd')
+    if output is not None:
+        mlab.savefig(output)
     mlab.show()
 
 
-def show_mapping(contour):
+def show_mapping(contour, output=None):
     from mayavi import mlab
     mlab.clf()
-    mlab.triangle_mesh(*triangle_args(contour.contour), scalars=contour.travel)
+    mlab.triangular_mesh(*triangle_args(contour.contour), scalars=contour.travel)
+    if output is not None:
+        mlab.savefig(output)
     mlab.show()
 
 
@@ -750,6 +754,10 @@ def main(args, stdin=None, stdout=None):
                         choices=('convergence', 'mapping', 'none'),
                         default='none',
                         help="Display visualization (Requires MayaVI) [Default: none]")
+    parser.add_argument('--visualize-file',
+                        type=str,
+                        default=None,
+                        help="Display visualization (Requires MayaVI) [Default: none]")
     parser.add_argument('--visualize-every',
                         type=int,
                         default=None,
@@ -758,12 +766,12 @@ def main(args, stdin=None, stdout=None):
 
     source = spatial.Surface.from_vet_file(params.surface_file)
 
-    if params.visualize_every is not None:
-        max_step = params.visualize_every
-        total_iterations = params.max_iterations
-        params.max_iterations = max_step
-    else:
-        total_iterations = params.max_iterations
+#    if params.visualize_every is not None:
+#        max_step = params.visualize_every
+#        total_iterations = params.max_iterations
+#        params.max_iterations = max_step
+#    else:
+    total_iterations = params.max_iterations
 
     contour = Snake(source,
                 resolution=params.voxel_resolution,
@@ -789,19 +797,19 @@ def main(args, stdin=None, stdout=None):
 
     while contour.max_iterations > total_iterations:
         contour.run()
-        if params.visualize_every is not None:
-            contour.max_iteratons += max_step
-            if params.visualize == 'convergence':
-                show_travel(contour)
-            elif params.visualize == 'mapping':
-                show_mapping(contour)
+#        if params.visualize_every is not None:
+#            contour.max_iteratons += max_step
+#            if params.visualize == 'convergence':
+#                show_travel(contour)
+#            elif params.visualize == 'mapping':
+#                show_mapping(contour)
 
     dump_sphmap(params.mapping_file, contour)
     
     if params.visualize == 'convergence':
-        show_travel(contour)
+        show_travel(contour, params.visualize_file)
     elif params.visualize == 'mapping':
-        show_mapping(contour)
+        show_mapping(contour, params.visualize_file)
                         
 
 if __name__ == '__main__':
