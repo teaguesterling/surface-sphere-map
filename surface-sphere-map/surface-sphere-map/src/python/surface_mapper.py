@@ -747,7 +747,7 @@ def main(args, stdin=None, stdout=None):
                         help="Only consider snapping in convergence [Default: %(default)s]")
     parser.add_argument('--max-iterations',
                         type=int,
-                        default=100,
+                        default=500,
                         help="Maxiumum number of iterations to run before forced termination [Default: %(default)s]")
 
     parser.add_argument('--visualize',
