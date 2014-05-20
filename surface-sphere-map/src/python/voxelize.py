@@ -23,26 +23,18 @@ def square_up_image(I, padding=1, mode='constant', constant_values=0):
     return padded, extend
 
 
-def voxelize_mesh(mesh, resolution=1.0, 
-                        cube=True,
-                        padding=5, 
-                        fill=False,
-                        triangle_map=False):
+def voxelize_mesh(mesh, axes, fill=False, triangle_map=False):
     
-    axes = PseudoGrid.from_extents(mesh.extents, resolution=resolution,
-                                                 padding=padding,
-                                                 cube=cube)
-    image, tri_voxels = voxelize_mesh_boundary(mesh, axes, resolution=resolution,
-                                                           triangle_map=triangle_map)
+    image, tri_voxels = voxelize_mesh_boundary(mesh, axes, triangle_map=triangle_map)
     if fill:
         image = fill_voxelized_mesh(image, axes, tri_voxels)
     if triangle_map:
-        return image, axes, tri_voxels
+        return image, tri_voxels
     else:
-        return image, axes
+        return image
 
 
-def voxelize_mesh_boundary(mesh, axes, resolution=1.0, triangle_map=False):
+def voxelize_mesh_boundary(mesh, axes, triangle_map=False):
     image = axes.get_array(dtype=bool)
     triangle_voxels = defaultdict(list)
     for i, triangle in enumerate(mesh.triangles):

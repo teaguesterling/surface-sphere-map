@@ -64,13 +64,9 @@ class PseudoGrid(list):
         return super(PseudoGrid, self).__getitem__(i)
 
     def position_on_axes(self, point):
-#        if self._resolution is not None and False:
         low = np.array(map(operator.itemgetter(0), self.extents))
         res = np.array(self._resolution)
         idx = tuple(np.trunc((point - low) / res).astype(np.int))
-#        else:
-#            points_in_dim = zip(self, point)
-#            insert_idx = tuple(itertools.starmap(np.searchsorted, points_in_dim))
         return idx 
 
     def map_to_axes(self, points):
@@ -78,6 +74,14 @@ class PseudoGrid(list):
         res = self._resolution
         indicies = np.trunc((points - low) / res).astype(np.int)
         return indicies
+
+    def all_indicies_in_grid(self, indices):
+        limits = np.array(map(len, self))
+        return np.all(indicies >= 0) and np.all(indicies < limits)
+
+    def all_points_in_grid(self, points):
+        lower, upper = np.array(self.extents).T
+        return np.all(points <= upper) and np.all(points >= lower)
 
     def nearest(self, point):
         index = self.position_on_axes(point)
@@ -215,8 +219,8 @@ class PseudoGrid(list):
 
     @property
     def resolution(self):
-        if self.resolution is not None:
-            return self.resolution
+        if self._resolution is not None:
+            return self._resolution
         else:
             n_dims = len(self)
             zeros = [0] * n_dims
