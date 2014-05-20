@@ -471,12 +471,11 @@ class Snake(object):
 
         # Bring back inside bounds
         i = 0
-        dummy_external = np.zeros((len(self.vertices), 3))
-        while i < 100 and not self.axes.all_points_in_grid(self.vertices):
-            self.vertices = self.relax_internal_force(self.vertices, dummy_external)
+        while i < 500 and not self.axes.all_points_in_grid(self.vertices):
+            self.vertices = self.relax_internal_force(self.vertices, remove_external=False)
             i += 1
-        if i >= 100:
-            print("Overload!")
+        if i >= 500:
+            self.log.error("Contour did not return to grid after 500 steps. Minimization likey to fail!")
 
     def _reset(self):
         self.vertices = self.contour.vertices.copy()
@@ -494,13 +493,22 @@ class Snake(object):
     def unit_starting_points(self):
         return self.contour.unit_vertices
 
+    @property
+    def spherical_starting_points(self):
+        r = self.contour_radius
+        coords = np.zeros((len(self.vertices), 2))
+        xs, ys, zs  = self.vertices.transpose()
+        sph_coords[0,:] = np.arccos(zs / r)
+        sph_coords[1,:] = np.arctan2(ys, xz)
+        return sph_coords
+
     def image_force(self, active=None):
         total_force = np.zeros(self.vertices.shape)
         vertices = self.vertices
         vertex_voxels = self.axes.map_to_axes(vertices)
         deltas = np.zeros(len(self.forces))
         active_forces = self.forces
-        if indicies is not None:
+        if active is not None:
             active_forces = [f for i,f in active_forces if i in active]
         for i, force in enumerate(active_forces):
             force_element = force(vertices, vertex_voxels)
@@ -508,10 +516,12 @@ class Snake(object):
             deltas[i] = np.apply_along_axis(norm, 1, force_element).sum()
         return total_force, deltas
 
-    def relax_internal_force(self, vertices, external, remove_external=True):
+    def relax_internal_force(self, vertices, external=None, remove_external=True):
         new_vertices = np.apply_along_axis(self.apply_internal_force, 0, vertices)
         if self.remove_external_component and remove_external:
             raise NotImplementedError
+            if external is None:
+                raise ValueError("External forces must be supplied to remove from interal")
             magnitudes = np.apply_along_axis(norm, 1, external)
             magnitudes[magnitudes==0] = 1
             directions = external / magnitudes[:,np.newaxis]
@@ -583,7 +593,7 @@ def load_sphmap(stream):
         First Line: [# Vertices, Original Sphere Radius, Original Sphere Center (XYZ)]
         Others: [Shape (distance), 
                  Sphere Coords (XYZ),
-                 Unit Sphere Coords (XYZ),
+                 Sphere Coords (Phi, Theta),  
                  Surface Coords (XYZ)]
     """
     tokens = next(stream).split()
@@ -597,23 +607,23 @@ def dump_sphmap(stream, snake):
         First Line: [# Vertices, Original Sphere Radius, Original Sphere Center (XYZ)]
         Others: [Shape (distance), 
                  Sphere Coords (XYZ),
-                 Unit Sphere Coords (XYZ),
+                 Sphere Coords (Phi, Theta),
                  Surface Coords (XYZ)]
     """
     dump_data = zip(snake.travel, 
                     snake.starting_points, 
-                    snake.unit_starting_points, 
+                    snake.spherical_starting_points, 
                     snake.vertices)
     num_vertices = len(snake.vertices)
     radius = snake.contour.radius
     cx, cy, cz = snake.contour.center
     print("{0}\t{1}\t{2}\t{3}\t{4}".format(num_vertices, radius, cx, cy, cz), file=stream)
     for idx, vertex_data in enumerate(dump_data):
-        travel, points, unit_travel, unit_points, on_surf = vertex_data
+        travel, points, spherical_points, on_surf = vertex_data
         line = []
         line.append(travel)
         line.extend(points)
-        line.extend(unit_points)
+        line.extend(spherical_points)
         line.extend(on_surf)
         format = ("{:.4f}\t" * len(line)).strip()
         print(format.format(*line), file=stream)
